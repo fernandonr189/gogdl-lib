@@ -42,6 +42,14 @@ impl GogDl {
         Ok(auth)
     }
 
+    pub async fn get_game_details(&self, game_id: i32) -> Result<GameDetails, GogdlError> {
+        if let Some(auth) = self.auth.as_ref() {
+            let game_details = games::get_game_details(auth, &self.client, game_id).await?;
+            Ok(game_details)
+        } else {
+            return Err(GogdlError::NotLoggedIn);
+        }
+    }
     pub async fn get_owned_games(&self) -> Result<Vec<GameDetails>, GogdlError> {
         if let Some(auth) = self.auth.as_ref() {
             let games = games::get_owned_games(&auth, &self.client).await?;
