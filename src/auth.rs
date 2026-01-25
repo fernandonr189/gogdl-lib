@@ -5,7 +5,7 @@ use crate::client::{ClientError, Method, fetch_json};
 
 pub const LOGIN_URL: &str = "https://auth.gog.com/auth?client_id=46899977096215655&redirect_uri=https://embed.gog.com/on_login_success?origin=client&response_type=code&layout=client2";
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct Auth {
     pub access_token: String,
     pub refresh_token: String,

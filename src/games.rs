@@ -4,8 +4,10 @@ use std::{
         Arc,
         atomic::{AtomicI64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use url::Url;
 
 use crate::{
     auth::Auth,
@@ -20,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Semaphore, mpsc::UnboundedSender},
+    sync::{RwLock, Semaphore, mpsc::UnboundedSender},
     task::JoinHandle,
 };
 
@@ -86,6 +88,9 @@ pub struct DepotFile {
     pub chunks: Option<Vec<Chunk>>,
     #[serde(alias = "type")]
     pub file_type: String,
+    /// The product_id this file belongs to (set during processing)
+    #[serde(skip)]
+    pub product_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -123,6 +128,84 @@ pub struct UrlFormat {
 pub struct SecureLinks {
     pub product_id: u64,
     pub urls: Vec<UrlFormat>,
+}
+
+/// Wrapper that manages secure links with automatic refresh when expired
+pub struct SecureLinksManager {
+    auth: Auth,
+    client: Client,
+    /// Cache of secure links per product_id
+    links_cache: RwLock<std::collections::HashMap<String, SecureLinks>>,
+    /// Buffer time in seconds before actual expiry to refresh (default 5 minutes)
+    refresh_buffer: u64,
+}
+
+impl SecureLinksManager {
+    pub fn new(auth: Auth, client: Client) -> Self {
+        Self {
+            auth,
+            client,
+            links_cache: RwLock::new(std::collections::HashMap::new()),
+            refresh_buffer: 300, // 5 minutes buffer
+        }
+    }
+
+    /// Get current timestamp in seconds since UNIX epoch
+    fn current_timestamp() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    /// Check if the current links are expired or about to expire
+    fn is_expired(links: &SecureLinks, buffer: u64) -> bool {
+        let now = Self::current_timestamp();
+
+        // Check if any URL format has an expires_at that's past or within buffer
+        for url_format in &links.urls {
+            if let Some(expires_at) = url_format.parameters.expires_at {
+                if now + buffer >= expires_at {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Get secure links for a specific product_id, refreshing if expired or not cached
+    pub async fn get_links_for_product(
+        &self,
+        product_id: &str,
+    ) -> Result<SecureLinks, ClientError> {
+        // First, check with read lock if we have valid cached links
+        {
+            let cache = self.links_cache.read().await;
+            if let Some(links) = cache.get(product_id) {
+                if !Self::is_expired(links, self.refresh_buffer) {
+                    return Ok(links.clone());
+                }
+            }
+        }
+
+        // Need to fetch or refresh - acquire write lock
+        let mut cache = self.links_cache.write().await;
+
+        // Double-check after acquiring write lock (another task might have fetched)
+        if let Some(links) = cache.get(product_id) {
+            if !Self::is_expired(links, self.refresh_buffer) {
+                return Ok(links.clone());
+            }
+        }
+
+        // Fetch new links for this product_id
+        eprintln!("Fetching secure links for product {}...", product_id);
+        let product_id_int: i32 = product_id.parse().map_err(|_| ClientError::NotFound)?;
+        let new_links = get_secure_links(&self.auth, &self.client, product_id_int).await?;
+        cache.insert(product_id.to_string(), new_links.clone());
+
+        Ok(new_links)
+    }
 }
 
 pub async fn get_owned_games(
@@ -252,8 +335,9 @@ pub async fn get_build_files(
 
     let mut files: Vec<DepotFile> = Vec::new();
 
-    for info in depot_files {
-        for file in info.depot.items {
+    for (info, depot) in depot_files.iter().zip(build_metadata.depots.iter()) {
+        for mut file in info.depot.items.clone() {
+            file.product_id = Some(depot.product_id.clone());
             files.push(file);
         }
     }
@@ -311,10 +395,29 @@ pub async fn get_secure_links(
 
 async fn handle_chunk_download(
     chunk: &Chunk,
-    url_format: &UrlFormat,
+    secure_links_manager: &Arc<SecureLinksManager>,
+    product_id: &str,
     client: &reqwest::Client,
     tx: &UnboundedSender<i64>,
 ) -> Result<Vec<u8>, ClientError> {
+    // Get fresh links for this product (will refresh if expired)
+    let secure_links = secure_links_manager
+        .get_links_for_product(product_id)
+        .await?;
+
+    let max_priority = secure_links
+        .urls
+        .iter()
+        .map(|link| link.priority)
+        .max()
+        .unwrap_or(0);
+
+    let url_format = secure_links
+        .urls
+        .iter()
+        .find(|link| link.priority == max_priority)
+        .expect("no secure link with max priority");
+
     let url = url_format.parse_url(&chunk.compressed_md5);
     let alternate_url = url_format.parse_url_redist(&chunk.compressed_md5);
 
@@ -327,7 +430,7 @@ async fn handle_chunk_download(
     .await
     {
         Ok(chunk) => Ok(chunk),
-        Err(_err) => {
+        Err(_primary_err) => {
             let downloaded = bytes_clone.swap(0, Ordering::Relaxed);
             let _ = tx.send(-downloaded);
             match fetch_chunk(&alternate_url, None, &client, |f| {
@@ -388,7 +491,7 @@ fn handle_file_downloads(
     chunks: Vec<Chunk>,
     semaphore: Arc<Semaphore>,
     hashing_semaphore: Arc<Semaphore>,
-    secure_links: Arc<SecureLinks>,
+    secure_links_manager: Arc<SecureLinksManager>,
     client: &Client,
     tx: &UnboundedSender<i64>,
     file: DepotFile,
@@ -401,19 +504,6 @@ fn handle_file_downloads(
     let game_name_clone = game_name.to_string();
 
     let handle: JoinHandle<Result<(), ClientError>> = tokio::spawn(async move {
-        let max_priority = secure_links
-            .urls
-            .iter()
-            .map(|link| link.priority)
-            .max()
-            .unwrap_or(0);
-
-        let url_format = secure_links
-            .urls
-            .iter()
-            .find(|link| link.priority == max_priority)
-            .expect("no secure link with max priority");
-
         let file_path = format!(
             "{}/{}/{}",
             path_copy,
@@ -481,7 +571,16 @@ fn handle_file_downloads(
             const MAX_RETRIES: usize = 3;
             let mut retries: usize = 0;
             loop {
-                match handle_chunk_download(&chunk, url_format, &client, &tx_clone).await {
+                let product_id = file.product_id.as_deref().unwrap_or("unknown");
+                match handle_chunk_download(
+                    &chunk,
+                    &secure_links_manager,
+                    product_id,
+                    &client,
+                    &tx_clone,
+                )
+                .await
+                {
                     Ok(data) => {
                         md5_ctx.consume(&data);
                         sha256_ctx.update(&data);
@@ -533,8 +632,6 @@ pub async fn download_game(
     tx: UnboundedSender<i64>,
     path: &str,
 ) -> Result<(), ClientError> {
-    let secure_links = get_secure_links(auth, client, game_id).await?;
-
     let game_files = get_build_files(auth, client, game_id, build_name).await?;
 
     let game_details = get_game_details(auth, client, game_id).await?;
@@ -544,7 +641,9 @@ pub async fn download_game(
 
     let mut handles: Vec<JoinHandle<Result<(), ClientError>>> = Vec::new();
 
-    let secure_links = Arc::new(secure_links);
+    // Create a manager that will fetch and cache secure links per product_id
+    let secure_links_manager = Arc::new(SecureLinksManager::new(auth.clone(), client.clone()));
+
     for file in game_files {
         let file_clone = file.clone();
         if let Some(chunks) = file.chunks {
@@ -552,7 +651,7 @@ pub async fn download_game(
                 chunks,
                 semaphore.clone(),
                 hashing_semaphore.clone(),
-                secure_links.clone(),
+                secure_links_manager.clone(),
                 client,
                 &tx,
                 file_clone,
@@ -612,14 +711,17 @@ impl UrlFormat {
         if let Some(l) = &self.parameters.l {
             url = url.replace("{l}", l);
         }
-        let galaxy_path = format!(
-            "/{}/{}/{}",
-            &chunk_hash[0..2],
-            &chunk_hash[2..4],
-            chunk_hash
-        );
-        url = format!("{}{}", url, galaxy_path);
+        let galaxy_path = format!("{}/{}/{}", &chunk_hash[0..2], &chunk_hash[2..4], chunk_hash);
 
-        url
+        // Properly insert chunk path into URL path component (before query string)
+        if let Ok(mut parsed_url) = Url::parse(&url) {
+            let current_path = parsed_url.path().trim_end_matches('/');
+            let new_path = format!("{}/{}", current_path, galaxy_path);
+            parsed_url.set_path(&new_path);
+            parsed_url.to_string()
+        } else {
+            // Fallback to simple concatenation if URL parsing fails
+            format!("{}/{}", url.trim_end_matches('/'), galaxy_path)
+        }
     }
 }
