@@ -54,7 +54,7 @@ pub struct GameBuilds {
     pub items: Vec<GameBuild>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Depot {
     pub manifest: String,
     pub size: u64,
@@ -64,10 +64,14 @@ pub struct Depot {
     pub product_id: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct BuildMetadata {
     pub dependencies: Option<Vec<String>>,
     pub depots: Vec<Depot>,
+    #[serde(alias = "clientId")]
+    pub client_id: String,
+    #[serde(alias = "clientSecret")]
+    pub client_secret: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

@@ -6,7 +6,7 @@ use std::io::prelude::*;
 use thiserror::Error;
 use tokio::{sync::AcquireError, task::JoinError};
 
-use crate::auth::Auth;
+use crate::auth::{Auth, SavesAuth};
 
 #[derive(Error, Debug)]
 pub enum ClientError {
@@ -87,6 +87,55 @@ where
     z.read_to_end(&mut decoded_buffer)?;
     Ok(decoded_buffer)
 }
+pub async fn fetch_plain<T>(
+    url: &str,
+    auth: Option<&SavesAuth>,
+    client: &Client,
+    method: Method,
+    decode: bool,
+    body: Option<T>,
+) -> Result<String, ClientError>
+where
+    T: Into<Body>,
+{
+    let url = Url::parse(url)?;
+    let mut request = match method {
+        Method::Get => client.get(url),
+        Method::Post => {
+            let mut r = client.post(url);
+            if let Some(body) = body {
+                r = r.body(body);
+            }
+            r
+        }
+    };
+
+    if let Some(auth) = auth {
+        request = request.bearer_auth(&auth.access_token);
+    }
+
+    let response = request.send().await?;
+    let status = response.status();
+
+    if !status.is_success() {
+        let response_text = response.text().await?;
+        return Err(ClientError::Http {
+            status,
+            body: response_text,
+        });
+    }
+
+    if decode {
+        let response_bytes = response.bytes().await?;
+        let mut z = ZlibDecoder::new(&response_bytes[..]);
+        let mut s = String::new();
+        z.read_to_string(&mut s)?;
+        Ok(s)
+    } else {
+        let response_text = response.text().await?;
+        Ok(response_text)
+    }
+}
 
 pub async fn fetch_json<T, P>(
     url: &str,
@@ -126,6 +175,7 @@ where
             body: response_text,
         });
     }
+    let headers = response.headers().clone();
 
     if decode {
         let response_bytes = response.bytes().await?;
@@ -136,7 +186,13 @@ where
         Ok(data)
     } else {
         let response_text = response.text().await?;
-        let data = serde_json::from_str(&response_text)?;
+        let data = match serde_json::from_str(&response_text) {
+            Ok(data) => data,
+            Err(err) => {
+                println!("Headers: \n{:?}", headers);
+                return Err(ClientError::Deserialize(err));
+            }
+        };
         Ok(data)
     }
 }

@@ -5,11 +5,13 @@ use crate::{
     auth::{Auth, get_login_tokens, refresh_token},
     client::ClientError,
     games::{BuildMetadata, Chunk, DepotFile, GameBuilds, GameDetails, SecureLinks},
+    saves::RemoteConfig,
 };
 
 pub mod auth;
 pub mod client;
 pub mod games;
+pub mod saves;
 
 pub struct GogDl {
     auth: Option<Auth>,
@@ -127,6 +129,33 @@ impl GogDl {
             Ok(secure_links)
         } else {
             return Err(GogdlError::NotLoggedIn);
+        }
+    }
+    pub async fn get_remote_config(&self, client_id: &str) -> Result<RemoteConfig, ClientError> {
+        let remote_config = saves::get_remote_config(&self.client, client_id).await?;
+        Ok(remote_config)
+    }
+    pub async fn get_auth_ids(&self, game_id: i32) -> Result<(String, String), ClientError> {
+        if let Some(auth) = self.auth.as_ref() {
+            let auth_ids = saves::get_auth_ids(&self.client, game_id, auth).await?;
+            Ok(auth_ids)
+        } else {
+            return Err(ClientError::NotFound);
+        }
+    }
+    pub async fn get_save_file_list(
+        &mut self,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<String, ClientError> {
+        if let Some(auth) = self.auth.as_ref() {
+            let saves_auth = auth
+                .get_cloud_saves_tokens(&self.client, client_id, client_secret)
+                .await?;
+            let response = saves::get_save_files_list(&self.client, client_id, &saves_auth).await?;
+            Ok(response)
+        } else {
+            Err(ClientError::NotFound)
         }
     }
 }

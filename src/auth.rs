@@ -11,8 +11,13 @@ pub struct Auth {
     pub refresh_token: String,
     pub expires_in: i32,
     pub token_type: String,
-    pub scope: String,
     pub session_id: String,
+    pub scope: Option<String>,
+    pub user_id: String,
+}
+#[derive(Deserialize, Serialize, Clone)]
+pub struct SavesAuth {
+    pub access_token: String,
     pub user_id: String,
 }
 
@@ -32,4 +37,21 @@ pub async fn get_login_tokens(code: &str, client: &Client) -> Result<Auth, Clien
     );
     let auth = fetch_json::<Auth, String>(&url, None, client, Method::Get, false, None).await?;
     Ok(auth)
+}
+
+impl Auth {
+    pub async fn get_cloud_saves_tokens(
+        &self,
+        client: &Client,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<SavesAuth, ClientError> {
+        let url = format!(
+            "https://auth.gog.com/token?client_id={}&client_secret={}&grant_type=refresh_token&refresh_token={}",
+            client_id, client_secret, self.refresh_token
+        );
+        let auth =
+            fetch_json::<SavesAuth, String>(&url, None, client, Method::Get, false, None).await?;
+        Ok(auth)
+    }
 }
