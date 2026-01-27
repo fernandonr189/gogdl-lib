@@ -1,9 +1,15 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicI64, Ordering},
+};
+
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
     auth::{Auth, SavesAuth},
-    client::{ClientError, fetch_json, fetch_plain},
+    client::{ClientError, fetch_json, fetch_plain, fetch_save_file},
     games::{BuildMetadata, get_game_builds},
 };
 
@@ -91,11 +97,36 @@ pub async fn get_auth_ids(
     Ok((auth_ids.client_id, auth_ids.client_secret))
 }
 
+#[derive(Debug, Clone)]
+pub struct SaveFile(String);
+
+impl SaveFile {
+    pub async fn download_file(
+        &self,
+        auth: &SavesAuth,
+        client: &Client,
+        tx: UnboundedSender<(i64, i64)>,
+    ) -> Result<(), ClientError> {
+        let url = format!(
+            "https://cloudstorage.gog.com/v1/{}/{}/{}",
+            auth.user_id, auth.client_id, &self.0
+        );
+        let downloaded_bytes = Arc::new(AtomicI64::new(0));
+        let bytes_clone = downloaded_bytes.clone();
+        let _file_data = fetch_save_file(&url, Some(auth), client, |bytes, total| {
+            bytes_clone.fetch_add(bytes, Ordering::Relaxed);
+            let _ = tx.send((bytes_clone.load(Ordering::Relaxed), total));
+        })
+        .await?;
+        Ok(())
+    }
+}
+
 pub async fn get_save_files_list(
     client: &Client,
     client_id: &str,
     auth: &SavesAuth,
-) -> Result<String, ClientError> {
+) -> Result<Vec<SaveFile>, ClientError> {
     let url = format!(
         "https://cloudstorage.gog.com/v1/{}/{}",
         auth.user_id, client_id
@@ -110,5 +141,10 @@ pub async fn get_save_files_list(
     )
     .await?;
 
-    Ok(response)
+    let save_files: Vec<SaveFile> = response
+        .lines()
+        .map(|line| SaveFile(line.to_string()))
+        .collect();
+
+    Ok(save_files)
 }

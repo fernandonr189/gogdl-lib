@@ -19,6 +19,8 @@ pub struct Auth {
 pub struct SavesAuth {
     pub access_token: String,
     pub user_id: String,
+    #[serde(skip)]
+    pub client_id: String,
 }
 
 pub async fn refresh_token(refresh_token: &str, client: &Client) -> Result<Auth, ClientError> {
@@ -50,8 +52,9 @@ impl Auth {
             "https://auth.gog.com/token?client_id={}&client_secret={}&grant_type=refresh_token&refresh_token={}",
             client_id, client_secret, self.refresh_token
         );
-        let auth =
+        let mut auth =
             fetch_json::<SavesAuth, String>(&url, None, client, Method::Get, false, None).await?;
+        auth.client_id = client_id.to_owned();
         Ok(auth)
     }
 }

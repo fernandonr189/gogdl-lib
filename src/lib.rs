@@ -5,7 +5,7 @@ use crate::{
     auth::{Auth, get_login_tokens, refresh_token},
     client::ClientError,
     games::{BuildMetadata, Chunk, DepotFile, GameBuilds, GameDetails, SecureLinks},
-    saves::RemoteConfig,
+    saves::{RemoteConfig, SaveFile},
 };
 
 pub mod auth;
@@ -144,16 +144,35 @@ impl GogDl {
         }
     }
     pub async fn get_save_file_list(
-        &mut self,
+        &self,
         client_id: &str,
         client_secret: &str,
-    ) -> Result<String, ClientError> {
+    ) -> Result<Vec<SaveFile>, ClientError> {
         if let Some(auth) = self.auth.as_ref() {
             let saves_auth = auth
                 .get_cloud_saves_tokens(&self.client, client_id, client_secret)
                 .await?;
             let response = saves::get_save_files_list(&self.client, client_id, &saves_auth).await?;
             Ok(response)
+        } else {
+            Err(ClientError::NotFound)
+        }
+    }
+    pub async fn download_save_file(
+        &self,
+        save_file: &SaveFile,
+        client_id: &str,
+        client_secret: &str,
+        tx: UnboundedSender<(i64, i64)>,
+    ) -> Result<(), ClientError> {
+        if let Some(auth) = self.auth.as_ref() {
+            let saves_auth = auth
+                .get_cloud_saves_tokens(&self.client, client_id, client_secret)
+                .await?;
+            save_file
+                .download_file(&saves_auth, &self.client, tx)
+                .await?;
+            Ok(())
         } else {
             Err(ClientError::NotFound)
         }

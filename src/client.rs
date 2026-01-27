@@ -1,4 +1,4 @@
-use flate2::read::ZlibDecoder;
+use flate2::read::{GzDecoder, ZlibDecoder};
 use futures::StreamExt;
 use reqwest::{Body, Client, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -40,6 +40,59 @@ pub enum ClientError {
 pub enum Method {
     Post,
     Get,
+}
+
+pub async fn fetch_save_file<F>(
+    url: &str,
+    auth: Option<&SavesAuth>,
+    client: &Client,
+    callback: F,
+) -> Result<Vec<u8>, ClientError>
+where
+    F: Fn(i64, i64),
+{
+    let url = Url::parse(url)?;
+    let mut request = client.get(url);
+
+    if let Some(auth) = auth {
+        request = request.bearer_auth(&auth.access_token);
+    }
+
+    let response = request.send().await?;
+    let headers = response.headers().clone();
+    let content_length = headers.get("content-length");
+    let status = response.status();
+
+    if !status.is_success() {
+        let response_text = response.text().await?;
+        return Err(ClientError::Http {
+            status,
+            body: response_text,
+        });
+    }
+
+    let mut stream = response.bytes_stream();
+
+    let mut buffer: Vec<u8> = Vec::new();
+
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(downloaded_bytes) => {
+                if let Some(lenght) = content_length {
+                    callback(
+                        downloaded_bytes.len() as i64,
+                        lenght.to_str().unwrap().parse::<i64>().unwrap(),
+                    );
+                }
+                buffer.extend_from_slice(&downloaded_bytes);
+            }
+            Err(err) => return Err(ClientError::Network(err)),
+        }
+    }
+    let mut decoded_buffer = Vec::new();
+    let mut z = GzDecoder::new(&buffer[..]);
+    z.read_to_end(&mut decoded_buffer)?;
+    Ok(decoded_buffer)
 }
 
 pub async fn fetch_chunk<F>(
@@ -87,6 +140,7 @@ where
     z.read_to_end(&mut decoded_buffer)?;
     Ok(decoded_buffer)
 }
+
 pub async fn fetch_plain<T>(
     url: &str,
     auth: Option<&SavesAuth>,
