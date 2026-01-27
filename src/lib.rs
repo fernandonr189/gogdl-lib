@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use thiserror::Error;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -164,13 +166,14 @@ impl GogDl {
         client_id: &str,
         client_secret: &str,
         tx: UnboundedSender<(i64, i64)>,
+        path: &PathBuf,
     ) -> Result<(), ClientError> {
         if let Some(auth) = self.auth.as_ref() {
             let saves_auth = auth
                 .get_cloud_saves_tokens(&self.client, client_id, client_secret)
                 .await?;
             save_file
-                .download_file(&saves_auth, &self.client, tx)
+                .download_file(&saves_auth, &self.client, tx, path)
                 .await?;
             Ok(())
         } else {

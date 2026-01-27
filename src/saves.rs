@@ -1,11 +1,15 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicI64, Ordering},
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
 };
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::{io::AsyncWriteExt, sync::mpsc::UnboundedSender};
 
 use crate::{
     auth::{Auth, SavesAuth},
@@ -51,8 +55,40 @@ pub struct RemoteConfig {
 }
 
 impl RemoteConfig {
+    fn known_folder_map(&self) -> HashMap<&'static str, &'static str> {
+        HashMap::from([
+            ("SAVED_GAMES", "Saved Games"),
+            ("DOCUMENTS", "Documents"),
+            ("DESKTOP", "Desktop"),
+            ("APPDATA", "AppData/Roaming"),
+            ("LOCAL_APPDATA", "AppData/Local"),
+            ("PROGRAMDATA", "ProgramData"),
+            ("PUBLIC", "Users/Public"),
+        ])
+    }
     pub fn is_supported(&self) -> bool {
         self.content.windows.cloud_storage.enabled
+    }
+    pub fn get_path(&self) -> Result<(String, String), ClientError> {
+        let map = self.known_folder_map();
+        let gog_path = self.content.windows.cloud_storage.locations[0]
+            .location
+            .clone();
+        let (placeholder, remainder) = gog_path.split_once('>').ok_or(ClientError::NotFound)?;
+
+        let folder_key = placeholder
+            .strip_prefix("<?")
+            .ok_or(ClientError::NotFound)?
+            .strip_suffix("?")
+            .ok_or(ClientError::NotFound)?;
+        let mapped = map
+            .get(folder_key)
+            .ok_or(ClientError::NotFound)?
+            .to_string();
+
+        let rest = remainder.strip_prefix("/").ok_or(ClientError::NotFound)?;
+
+        Ok((mapped, rest.to_owned()))
     }
 }
 
@@ -101,11 +137,18 @@ pub async fn get_auth_ids(
 pub struct SaveFile(String);
 
 impl SaveFile {
+    pub fn get_path(&self) -> String {
+        self.0.clone()
+    }
+}
+
+impl SaveFile {
     pub async fn download_file(
         &self,
         auth: &SavesAuth,
         client: &Client,
         tx: UnboundedSender<(i64, i64)>,
+        path: &PathBuf,
     ) -> Result<(), ClientError> {
         let url = format!(
             "https://cloudstorage.gog.com/v1/{}/{}/{}",
@@ -113,11 +156,46 @@ impl SaveFile {
         );
         let downloaded_bytes = Arc::new(AtomicI64::new(0));
         let bytes_clone = downloaded_bytes.clone();
-        let _file_data = fetch_save_file(&url, Some(auth), client, |bytes, total| {
+        let file_data = fetch_save_file(&url, Some(auth), client, |bytes, total| {
             bytes_clone.fetch_add(bytes, Ordering::Relaxed);
             let _ = tx.send((bytes_clone.load(Ordering::Relaxed), total));
         })
         .await?;
+
+        println!("Creating directories");
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        println!("Creating file");
+        let mut file = match tokio::fs::File::create(path).await {
+            Ok(f) => f,
+            Err(err) => {
+                println!("Path: {:?}", path);
+                println!("Error: {}", err);
+                return Err(ClientError::NotFound);
+            }
+        };
+
+        println!("Writing file");
+        match file.write_all(&file_data).await {
+            Ok(_) => (),
+            Err(err) => {
+                println!("Path: {:?}", path);
+                println!("Error: {}", err);
+                return Err(ClientError::NotFound);
+            }
+        };
+        match file.flush().await {
+            Ok(_) => (),
+            Err(err) => {
+                println!("Path: {:?}", path);
+                println!("Error: {}", err);
+                return Err(ClientError::NotFound);
+            }
+        };
+
+        println!("File written");
         Ok(())
     }
 }
