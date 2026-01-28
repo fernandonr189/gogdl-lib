@@ -47,7 +47,7 @@ pub async fn fetch_save_file<F>(
     auth: Option<&SavesAuth>,
     client: &Client,
     callback: F,
-) -> Result<(Vec<u8>, Option<String>), ClientError>
+) -> Result<(Vec<u8>, Option<String>, Option<String>), ClientError>
 where
     F: Fn(i64, i64),
 {
@@ -61,6 +61,7 @@ where
     let response = request.send().await?;
     let headers = response.headers().clone();
     let content_length = headers.get("content-length");
+    let last_modified = headers.get("x-object-meta-locallastmodified");
     let etag = headers.get("etag");
     let status = response.status();
 
@@ -101,11 +102,13 @@ where
             panic!()
         }
     }
+
+    let last_modified = last_modified.map(|h| h.to_str().unwrap().to_owned());
     if let Some(md5_header) = etag {
         let md5 = md5_header.to_str().unwrap();
-        Ok((buffer, Some(md5.to_owned())))
+        Ok((buffer, Some(md5.to_owned()), last_modified))
     } else {
-        Ok((buffer, None))
+        Ok((buffer, None, last_modified))
     }
 }
 

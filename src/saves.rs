@@ -8,6 +8,8 @@ use std::{
     },
 };
 
+use chrono::{DateTime, FixedOffset};
+use filetime::{FileTime, set_file_times};
 use flate2::read::GzDecoder;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -168,11 +170,12 @@ pub async fn download_file(
     );
     let downloaded_bytes = Arc::new(AtomicI64::new(0));
     let bytes_clone = downloaded_bytes.clone();
-    let (file_data, md5) = fetch_save_file(&url, Some(auth), client, |bytes, total| {
-        bytes_clone.fetch_add(bytes, Ordering::Relaxed);
-        let _ = tx.send((bytes_clone.load(Ordering::Relaxed), total));
-    })
-    .await?;
+    let (file_data, md5, last_modified) =
+        fetch_save_file(&url, Some(auth), client, |bytes, total| {
+            bytes_clone.fetch_add(bytes, Ordering::Relaxed);
+            let _ = tx.send((bytes_clone.load(Ordering::Relaxed), total));
+        })
+        .await?;
 
     if let Some(hash) = md5 {
         let digest = md5::compute(&file_data);
@@ -212,6 +215,11 @@ pub async fn download_file(
             return Err(ClientError::NotFound);
         }
     };
+    if let Some(timestamp) = last_modified {
+        let dt: DateTime<FixedOffset> = timestamp.parse().map_err(|_err| ClientError::NotFound)?;
+        let file_time = FileTime::from_unix_time(dt.timestamp(), dt.timestamp_subsec_nanos());
+        set_file_times(path, file_time, file_time)?;
+    }
 
     Ok(())
 }
