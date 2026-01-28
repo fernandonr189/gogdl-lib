@@ -1,4 +1,4 @@
-use flate2::read::{GzDecoder, ZlibDecoder};
+use flate2::read::ZlibDecoder;
 use futures::StreamExt;
 use reqwest::{Body, Client, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -47,7 +47,7 @@ pub async fn fetch_save_file<F>(
     auth: Option<&SavesAuth>,
     client: &Client,
     callback: F,
-) -> Result<Vec<u8>, ClientError>
+) -> Result<(Vec<u8>, Option<String>), ClientError>
 where
     F: Fn(i64, i64),
 {
@@ -61,6 +61,7 @@ where
     let response = request.send().await?;
     let headers = response.headers().clone();
     let content_length = headers.get("content-length");
+    let etag = headers.get("etag");
     let status = response.status();
 
     if !status.is_success() {
@@ -89,10 +90,23 @@ where
             Err(err) => return Err(ClientError::Network(err)),
         }
     }
-    let mut decoded_buffer = Vec::new();
-    let mut z = GzDecoder::new(&buffer[..]);
-    z.read_to_end(&mut decoded_buffer)?;
-    Ok(decoded_buffer)
+    if let Some(len) = content_length {
+        let expected = len.to_str().unwrap().parse::<usize>().unwrap();
+        if buffer.len() != expected {
+            println!(
+                "Truncated download: got {}, expected {}",
+                buffer.len(),
+                expected
+            );
+            panic!()
+        }
+    }
+    if let Some(md5_header) = etag {
+        let md5 = md5_header.to_str().unwrap();
+        Ok((buffer, Some(md5.to_owned())))
+    } else {
+        Ok((buffer, None))
+    }
 }
 
 pub async fn fetch_chunk<F>(
@@ -229,7 +243,6 @@ where
             body: response_text,
         });
     }
-    let headers = response.headers().clone();
 
     if decode {
         let response_bytes = response.bytes().await?;
@@ -243,7 +256,6 @@ where
         let data = match serde_json::from_str(&response_text) {
             Ok(data) => data,
             Err(err) => {
-                println!("Headers: \n{:?}", headers);
                 return Err(ClientError::Deserialize(err));
             }
         };

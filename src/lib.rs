@@ -172,9 +172,7 @@ impl GogDl {
             let saves_auth = auth
                 .get_cloud_saves_tokens(&self.client, client_id, client_secret)
                 .await?;
-            save_file
-                .download_file(&saves_auth, &self.client, tx, path)
-                .await?;
+            saves::download_file(save_file, &saves_auth, &self.client, tx, path).await?;
             Ok(())
         } else {
             Err(ClientError::NotFound)

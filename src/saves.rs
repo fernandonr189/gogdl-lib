@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    io::Read,
     path::PathBuf,
     sync::{
         Arc,
@@ -7,6 +8,7 @@ use std::{
     },
 };
 
+use flate2::read::GzDecoder;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncWriteExt, sync::mpsc::UnboundedSender};
@@ -64,13 +66,16 @@ impl RemoteConfig {
             ("LOCAL_APPDATA", "AppData/Local"),
             ("PROGRAMDATA", "ProgramData"),
             ("PUBLIC", "Users/Public"),
+            ("INSTALL", "INSTALLATION_PATH"),
         ])
     }
     pub fn is_supported(&self) -> bool {
         self.content.windows.cloud_storage.enabled
+            && self.content.windows.cloud_storage.locations.len() >= 1
     }
     pub fn get_path(&self) -> Result<(String, String), ClientError> {
         let map = self.known_folder_map();
+
         let gog_path = self.content.windows.cloud_storage.locations[0]
             .location
             .clone();
@@ -86,9 +91,17 @@ impl RemoteConfig {
             .ok_or(ClientError::NotFound)?
             .to_string();
 
-        let rest = remainder.strip_prefix("/").ok_or(ClientError::NotFound)?;
+        let mut path_buf = PathBuf::new();
 
-        Ok((mapped, rest.to_owned()))
+        remainder
+            .split(|c| c == '/' || c == '\\')
+            .filter(|s| !s.is_empty())
+            .for_each(|p| {
+                path_buf.push(p);
+            });
+
+        let path_str = path_buf.to_str().unwrap();
+        Ok((mapped, path_str.to_owned()))
     }
 }
 
@@ -138,66 +151,71 @@ pub struct SaveFile(String);
 
 impl SaveFile {
     pub fn get_path(&self) -> String {
-        self.0.clone()
+        self.0.clone().strip_prefix("saves/").unwrap().to_owned()
     }
 }
 
-impl SaveFile {
-    pub async fn download_file(
-        &self,
-        auth: &SavesAuth,
-        client: &Client,
-        tx: UnboundedSender<(i64, i64)>,
-        path: &PathBuf,
-    ) -> Result<(), ClientError> {
-        let url = format!(
-            "https://cloudstorage.gog.com/v1/{}/{}/{}",
-            auth.user_id, auth.client_id, &self.0
-        );
-        let downloaded_bytes = Arc::new(AtomicI64::new(0));
-        let bytes_clone = downloaded_bytes.clone();
-        let file_data = fetch_save_file(&url, Some(auth), client, |bytes, total| {
-            bytes_clone.fetch_add(bytes, Ordering::Relaxed);
-            let _ = tx.send((bytes_clone.load(Ordering::Relaxed), total));
-        })
-        .await?;
+pub async fn download_file(
+    save_file: &SaveFile,
+    auth: &SavesAuth,
+    client: &Client,
+    tx: UnboundedSender<(i64, i64)>,
+    path: &PathBuf,
+) -> Result<(), ClientError> {
+    let url = format!(
+        "https://cloudstorage.gog.com/v1/{}/{}/{}",
+        auth.user_id,
+        auth.client_id,
+        save_file.get_path()
+    );
+    let downloaded_bytes = Arc::new(AtomicI64::new(0));
+    let bytes_clone = downloaded_bytes.clone();
+    let (file_data, md5) = fetch_save_file(&url, Some(auth), client, |bytes, total| {
+        bytes_clone.fetch_add(bytes, Ordering::Relaxed);
+        let _ = tx.send((bytes_clone.load(Ordering::Relaxed), total));
+    })
+    .await?;
 
-        println!("Creating directories");
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        println!("Creating file");
-        let mut file = match tokio::fs::File::create(path).await {
-            Ok(f) => f,
-            Err(err) => {
-                println!("Path: {:?}", path);
-                println!("Error: {}", err);
-                return Err(ClientError::NotFound);
-            }
-        };
-
-        println!("Writing file");
-        match file.write_all(&file_data).await {
-            Ok(_) => (),
-            Err(err) => {
-                println!("Path: {:?}", path);
-                println!("Error: {}", err);
-                return Err(ClientError::NotFound);
-            }
-        };
-        match file.flush().await {
-            Ok(_) => (),
-            Err(err) => {
-                println!("Path: {:?}", path);
-                println!("Error: {}", err);
-                return Err(ClientError::NotFound);
-            }
-        };
-
-        println!("File written");
-        Ok(())
+    if let Some(hash) = md5 {
+        let digest = md5::compute(&file_data);
+        assert_eq!(format!("{:x}", digest), hash);
     }
+
+    let mut decoded_buffer = Vec::new();
+    let mut z = GzDecoder::new(&file_data[..]);
+    z.read_to_end(&mut decoded_buffer)?;
+
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let mut file = match tokio::fs::File::create(path).await {
+        Ok(f) => f,
+        Err(err) => {
+            println!("\nPath: {:?}", path);
+            println!("Error: {}", err);
+            return Err(ClientError::NotFound);
+        }
+    };
+
+    match file.write_all(&decoded_buffer).await {
+        Ok(_) => (),
+        Err(err) => {
+            println!("\nPath: {:?}", path);
+            println!("Error: {}", err);
+            return Err(ClientError::NotFound);
+        }
+    };
+    match file.flush().await {
+        Ok(_) => (),
+        Err(err) => {
+            println!("\nPath: {:?}", path);
+            println!("Error: {}", err);
+            return Err(ClientError::NotFound);
+        }
+    };
+
+    Ok(())
 }
 
 pub async fn get_save_files_list(

@@ -469,26 +469,54 @@ async fn handle_chunk_download(
     }
 }
 
-async fn hash_file(file: &mut tokio::fs::File) -> Result<(md5::Digest, [u8; 32]), std::io::Error> {
+async fn hash_file_md5(file: &mut tokio::fs::File) -> Result<md5::Digest, std::io::Error> {
     let mut md5_ctx = md5::Context::new();
-    let mut sha256_ctx = Sha256::new();
 
-    let mut buf = [0u8; 64 * 1024]; // 64 KiB buffer
+    let buf_size = match file.metadata().await?.len() {
+        s if s < 256 * 1024 => 64 * 1024,       // tiny files
+        s if s < 8 * 1024 * 1024 => 256 * 1024, // small
+        _ => 2 * 1024 * 1024,                   // large
+    };
+
+    let mut buffer = vec![0u8; buf_size];
 
     loop {
-        let n = file.read(&mut buf).await?;
+        let n = file.read(&mut buffer).await?;
         if n == 0 {
             break;
         }
 
-        md5_ctx.consume(&buf[..n]);
-        sha256_ctx.update(&buf[..n]);
+        md5_ctx.consume(&buffer[..n]);
     }
 
     let md5 = md5_ctx.finalize();
+
+    Ok(md5)
+}
+
+async fn hash_file_sha256(file: &mut tokio::fs::File) -> Result<[u8; 32], std::io::Error> {
+    let mut sha256_ctx = Sha256::new();
+
+    let buf_size = match file.metadata().await?.len() {
+        s if s < 256 * 1024 => 64 * 1024,       // tiny files
+        s if s < 8 * 1024 * 1024 => 256 * 1024, // small
+        _ => 2 * 1024 * 1024,                   // large
+    };
+
+    let mut buffer = vec![0u8; buf_size];
+
+    loop {
+        let n = file.read(&mut buffer).await?;
+        if n == 0 {
+            break;
+        }
+
+        sha256_ctx.update(&buffer[..n]);
+    }
+
     let sha256: [u8; 32] = sha256_ctx.finalize().into();
 
-    Ok((md5, sha256))
+    Ok(sha256)
 }
 
 fn handle_file_downloads(
@@ -531,20 +559,31 @@ fn handle_file_downloads(
         if let Ok(mut existing_file) = tokio::fs::File::open(path).await {
             let mut file_valid = true;
 
-            let (md5, sha256) = hash_file(&mut existing_file).await?;
+            match (&file.md5, &file.sha256) {
+                (None, None) => {}
+                (None, Some(file_sha256)) => {
+                    let sha256 = hash_file_sha256(&mut existing_file).await?;
+                    let sha256_hex = hex::encode(sha256);
 
-            if let Some(file_md5) = &file.md5 {
-                let md5_hex = format!("{:x}", md5);
-
-                if md5_hex != *file_md5 {
-                    file_valid = false;
+                    if sha256_hex != *file_sha256 {
+                        file_valid = false;
+                    }
                 }
-            }
-            if let Some(file_sha256) = &file.sha256 {
-                let sha256_hex = hex::encode(sha256);
+                (Some(file_md5), None) => {
+                    let md5 = hash_file_md5(&mut existing_file).await?;
+                    let md5_hex = format!("{:x}", md5);
 
-                if sha256_hex != *file_sha256 {
-                    file_valid = false;
+                    if md5_hex != *file_md5 {
+                        file_valid = false;
+                    }
+                }
+                (Some(file_md5), Some(_sha256)) => {
+                    let md5 = hash_file_md5(&mut existing_file).await?;
+                    let md5_hex = format!("{:x}", md5);
+
+                    if md5_hex != *file_md5 {
+                        file_valid = false;
+                    }
                 }
             }
 
