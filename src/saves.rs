@@ -164,9 +164,7 @@ pub async fn download_file(
 ) -> Result<(), ClientError> {
     let url = format!(
         "https://cloudstorage.gog.com/v1/{}/{}/{}",
-        auth.user_id,
-        auth.client_id,
-        save_file.get_path()
+        auth.user_id, auth.client_id, save_file.0
     );
     let downloaded_bytes = Arc::new(AtomicI64::new(0));
     let bytes_clone = downloaded_bytes.clone();
