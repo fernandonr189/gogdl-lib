@@ -265,6 +265,28 @@ impl GogDl {
             Err(ClientError::NotFound)
         }
     }
+    pub async fn upload_save_file(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        tx: UnboundedSender<(i64, i64)>,
+        path: &PathBuf,
+        url_path: &str,
+    ) -> Result<(), ClientError> {
+        let auth = {
+            let auth_lock = self.auth.lock().await;
+            auth_lock.clone()
+        };
+        if let Some(auth) = auth.as_ref() {
+            let saves_auth = auth
+                .get_cloud_saves_tokens(&self.client, client_id, client_secret)
+                .await?;
+            saves::upload_file(&self.client, &saves_auth, path, &url_path, tx).await?;
+            Ok(())
+        } else {
+            Err(ClientError::NotFound)
+        }
+    }
     pub async fn download_save_file(
         &self,
         save_file: &SaveFile,

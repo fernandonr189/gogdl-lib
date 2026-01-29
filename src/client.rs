@@ -1,6 +1,9 @@
-use flate2::read::ZlibDecoder;
+use flate2::{Compression, read::ZlibDecoder, write::GzEncoder};
 use futures::StreamExt;
-use reqwest::{Body, Client, StatusCode, Url};
+use reqwest::{
+    Body, Client, StatusCode, Url,
+    header::{ACCEPT, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, EXPECT, USER_AGENT},
+};
 use serde::de::DeserializeOwned;
 use std::io::prelude::*;
 use thiserror::Error;
@@ -40,6 +43,78 @@ pub enum ClientError {
 pub enum Method {
     Post,
     Get,
+}
+
+pub async fn upload_save_file<T>(
+    url: &str,
+    auth: Option<&SavesAuth>,
+    client: &Client,
+    timestamp: &str,
+    uncompressed_body: Vec<u8>,
+    callback: T,
+) -> Result<(), ClientError>
+where
+    T: Fn(i64, i64) + Send + Sync + 'static,
+{
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(6));
+    encoder.write_all(&uncompressed_body)?;
+    let mut gzipped = encoder.finish()?;
+    let total_len = gzipped.len() as i64;
+    let url = Url::parse(url)?;
+    let digest = md5::compute(&gzipped);
+    let etag = format!("{:x}", digest);
+    let mut request = client
+        .put(url)
+        .header("X-Object-Meta-LocalLastModified", timestamp)
+        .header(ETAG, etag)
+        .header(CONTENT_ENCODING, "gzip")
+        .header(CONTENT_LENGTH, total_len)
+        .header(EXPECT, "100-continue")
+        .header(ACCEPT, "*/*")
+        .header(
+            "X-Object-Meta-User-Agent",
+            "GOGGalaxyCommunicationService/2.0.4.164 (Windows_32bit)",
+        )
+        .header(
+            USER_AGENT,
+            "GOGGalaxyCommunicationService/2.0.4.164 (Windows_32bit)",
+        )
+        .header(CONTENT_TYPE, "application/octet-stream");
+
+    if let Some(auth) = auth {
+        request = request.bearer_auth(&auth.access_token);
+    }
+
+    let mut sent = 0;
+
+    let body_stream = futures_util::stream::iter(std::iter::from_fn(move || {
+        if gzipped.is_empty() {
+            return None;
+        }
+        let chunk = gzipped
+            .drain(..gzipped.len().min(16 * 1024))
+            .collect::<Vec<_>>();
+        sent += chunk.len() as i64;
+        callback(sent, total_len);
+
+        Some(Ok::<_, std::io::Error>(chunk))
+    }));
+
+    let body = reqwest::Body::wrap_stream(body_stream);
+
+    println!("Request: {:?}", request);
+
+    request = request.body(body);
+    let response = request.send().await?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        let text = response.text().await?;
+        return Err(ClientError::Http { status, body: text });
+    }
+
+    Ok(())
 }
 
 pub async fn fetch_save_file<F>(

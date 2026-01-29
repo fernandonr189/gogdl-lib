@@ -14,6 +14,7 @@ chrono = "0.4.43"
 filetime = "0.2.27"
 flate2 = { version="1.1.5", default-features = false, features = ["zlib-rs"]}
 futures = "0.3.31"
+futures-util = "0.3.31"
 hex = "0.4.3"
 md5 = "0.8.0"
 reqwest = { version = "0.12.25", default-features = false, features = ["stream", "rustls-tls"] }
@@ -23,3 +24,4 @@ sha2 = "0.10.9"
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", default-features = false, features = ["rt-multi-thread", "fs"] }
 url = "2.5.7"
+uuid = { version = "1.20.0", default-features = false, features = ["v4"] }

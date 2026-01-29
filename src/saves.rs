@@ -1,26 +1,26 @@
 use std::{
     collections::HashMap,
     io::Read,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicI64, Ordering},
     },
 };
 
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, SecondsFormat, Utc};
 use filetime::{FileTime, set_file_times};
 use flate2::read::GzDecoder;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     sync::{Mutex, mpsc::UnboundedSender},
 };
 
 use crate::{
     auth::{Auth, SavesAuth},
-    client::{ClientError, fetch_json, fetch_plain, fetch_save_file},
+    client::{ClientError, fetch_json, fetch_plain, fetch_save_file, upload_save_file},
     games::{BuildMetadata, GameDetails, get_game_builds},
 };
 
@@ -226,6 +226,42 @@ pub async fn download_file(
     }
 
     Ok(())
+}
+
+pub async fn upload_file(
+    client: &Client,
+    auth: &SavesAuth,
+    path: &Path,
+    url_path: &str,
+    tx: UnboundedSender<(i64, i64)>,
+) -> Result<(), ClientError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let url = format!(
+        "https://cloudstorage.gog.com/v1/{}/{}/saves/{}?_gog_request_id={}",
+        auth.user_id, auth.client_id, url_path, request_id
+    );
+
+    let mut file = tokio::fs::File::open(path).await?;
+
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).await?;
+
+    let metadata = tokio::fs::metadata(path).await?;
+    let modified = metadata.modified()?;
+    let modified: DateTime<Utc> = modified.into();
+    let timestamp = modified.to_rfc3339_opts(SecondsFormat::Secs, true);
+
+    upload_save_file(
+        &url,
+        Some(auth),
+        client,
+        &timestamp,
+        buffer,
+        move |sent, total| {
+            let _ = tx.send((sent, total));
+        },
+    )
+    .await
 }
 
 pub async fn get_save_files_list(
