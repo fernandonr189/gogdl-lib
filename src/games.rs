@@ -204,7 +204,6 @@ impl SecureLinksManager {
         }
 
         // Fetch new links for this product_id
-        eprintln!("Fetching secure links for product {}...", product_id);
         let product_id_int: i32 = product_id.parse().map_err(|_| ClientError::NotFound)?;
         let new_links = get_secure_links(&self.auth, &self.client, product_id_int).await?;
         cache.insert(product_id.to_string(), new_links.clone());
@@ -220,24 +219,27 @@ pub async fn get_owned_games(
     game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
 ) -> Result<Vec<GameDetails>, ClientError> {
     let game_ids;
-    {
-        let cache_lock = game_ids_cache.lock().await;
 
-        if let Some(ids_cache) = cache_lock.as_ref() {
-            game_ids = GameIds {
-                owned: ids_cache.clone(),
-            };
-        } else {
-            game_ids = fetch_json::<GameIds, String>(
-                "https://embed.gog.com/user/data/games",
-                Some(auth),
-                client,
-                Method::Get,
-                false,
-                None,
-            )
-            .await?;
-        }
+    let cached_ids = {
+        let cache_lock = game_ids_cache.lock().await;
+        cache_lock.clone()
+    };
+
+    if let Some(ids_cache) = cached_ids {
+        game_ids = GameIds { owned: ids_cache };
+    } else {
+        game_ids = fetch_json::<GameIds, String>(
+            "https://embed.gog.com/user/data/games",
+            Some(auth),
+            client,
+            Method::Get,
+            false,
+            None,
+        )
+        .await?;
+
+        let mut cache_lock = game_ids_cache.lock().await;
+        *cache_lock = Some(game_ids.owned.clone());
     }
 
     let games = stream::iter(game_ids.owned)
@@ -346,8 +348,14 @@ pub async fn get_depot_information(
         &manifest
     );
 
-    let depot_information =
+    let product_id = depot.product_id.clone();
+
+    let mut depot_information =
         fetch_json::<DepotInfo, String>(&url, Some(auth), client, Method::Get, true, None).await?;
+
+    depot_information.depot.items.iter_mut().for_each(|item| {
+        item.product_id = Some(product_id.clone());
+    });
 
     Ok(depot_information)
 }
@@ -358,7 +366,25 @@ pub async fn get_build_files(
     game_id: i32,
     version_name: &str,
     game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
+    game_ids_cache: Arc<Mutex<Option<Vec<i32>>>>,
 ) -> Result<Vec<DepotFile>, ClientError> {
+    let mut cache = {
+        let cache_lock = game_ids_cache.lock().await;
+        cache_lock.clone()
+    };
+
+    if let None = cache {
+        let _ = get_owned_games(
+            auth,
+            client,
+            game_ids_cache.clone(),
+            game_details_cache.clone(),
+        )
+        .await?;
+        let cache_lock = game_ids_cache.lock().await;
+        cache = cache_lock.clone();
+    }
+
     let build_metadata = get_build_metadata(
         auth,
         client,
@@ -385,7 +411,15 @@ pub async fn get_build_files(
     for (info, depot) in depot_files.iter().zip(build_metadata.depots.iter()) {
         for mut file in info.depot.items.clone() {
             file.product_id = Some(depot.product_id.clone());
-            files.push(file);
+
+            if let (Some(owned_ids), Some(file_product_id)) =
+                (cache.as_ref(), file.product_id.as_ref())
+            {
+                let file_id_int = file_product_id.parse::<i32>().unwrap();
+                if owned_ids.contains(&file_id_int) {
+                    files.push(file);
+                }
+            }
         }
     }
 
@@ -398,6 +432,7 @@ pub async fn get_build_chunks(
     game_id: i32,
     version_name: &str,
     game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
+    game_ids_cache: Arc<Mutex<Option<Vec<i32>>>>,
 ) -> Result<Vec<Chunk>, ClientError> {
     let build_metadata = get_build_metadata(
         auth,
@@ -420,11 +455,27 @@ pub async fn get_build_chunks(
 
     let depot_files = depot_files?;
 
+    let mut cache = {
+        let cache_lock = game_ids_cache.lock().await;
+        cache_lock.clone()
+    };
+
+    if let None = cache {
+        let _ = get_owned_games(auth, client, game_ids_cache.clone(), game_details_cache).await?;
+        let cache_lock = game_ids_cache.lock().await;
+        cache = cache_lock.clone();
+    }
+
     let mut build_chunks: Vec<Chunk> = Vec::new();
     for info in depot_files {
         for file in info.depot.items {
-            if let Some(chunks) = file.chunks {
-                build_chunks.extend(chunks);
+            if let (Some(ids), Some(file_id)) = (cache.as_ref(), file.product_id) {
+                let file_id_int = file_id.parse::<i32>().unwrap();
+                if ids.contains(&file_id_int) {
+                    if let Some(chunks) = file.chunks {
+                        build_chunks.extend(chunks);
+                    }
+                }
             }
         }
     }
@@ -726,6 +777,7 @@ pub async fn download_game(
     tx: UnboundedSender<i64>,
     path: &str,
     game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
+    game_ids_cache: Arc<Mutex<Option<Vec<i32>>>>,
 ) -> Result<(), ClientError> {
     let game_files = get_build_files(
         auth,
@@ -733,6 +785,7 @@ pub async fn download_game(
         game_id,
         build_name,
         game_details_cache.clone(),
+        game_ids_cache.clone(),
     )
     .await?;
 

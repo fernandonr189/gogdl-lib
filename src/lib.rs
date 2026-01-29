@@ -156,6 +156,7 @@ impl GogDl {
                 game_id,
                 &version_name,
                 self.game_details_cache.clone(),
+                self.game_ids_cache.clone(),
             )
             .await?;
             Ok(depot_files)
@@ -183,6 +184,7 @@ impl GogDl {
                 tx,
                 path,
                 self.game_details_cache.clone(),
+                self.game_ids_cache.clone(),
             )
             .await?;
             Ok(res)
@@ -206,6 +208,7 @@ impl GogDl {
                 game_id,
                 &version_name,
                 self.game_details_cache.clone(),
+                self.game_ids_cache.clone(),
             )
             .await?;
             Ok(build_chunks)
