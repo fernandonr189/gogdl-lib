@@ -13,12 +13,15 @@ use filetime::{FileTime, set_file_times};
 use flate2::read::GzDecoder;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncWriteExt, sync::mpsc::UnboundedSender};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{Mutex, mpsc::UnboundedSender},
+};
 
 use crate::{
     auth::{Auth, SavesAuth},
     client::{ClientError, fetch_json, fetch_plain, fetch_save_file},
-    games::{BuildMetadata, get_game_builds},
+    games::{BuildMetadata, GameDetails, get_game_builds},
 };
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -132,8 +135,9 @@ pub async fn get_auth_ids(
     client: &Client,
     game_id: i32,
     auth: &Auth,
+    game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
 ) -> Result<(String, String), ClientError> {
-    let game_builds = get_game_builds(auth, client, game_id).await?;
+    let game_builds = get_game_builds(auth, client, game_id, game_details_cache.clone()).await?;
     let game_build_link = &game_builds.items[0].link;
 
     let auth_ids = fetch_json::<BuildMetadata, String>(

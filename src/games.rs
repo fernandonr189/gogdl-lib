@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{
         Arc,
@@ -22,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{RwLock, Semaphore, mpsc::UnboundedSender},
+    sync::{Mutex, RwLock, Semaphore, mpsc::UnboundedSender},
     task::JoinHandle,
 };
 
@@ -31,7 +32,7 @@ pub struct GameIds {
     pub owned: Vec<i32>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct GameDetails {
     pub title: String,
     #[serde(skip)]
@@ -215,19 +216,36 @@ impl SecureLinksManager {
 pub async fn get_owned_games(
     auth: &Auth,
     client: &reqwest::Client,
+    game_ids_cache: Arc<Mutex<Option<Vec<i32>>>>,
+    game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
 ) -> Result<Vec<GameDetails>, ClientError> {
-    let game_ids = fetch_json::<GameIds, String>(
-        "https://embed.gog.com/user/data/games",
-        Some(auth),
-        client,
-        Method::Get,
-        false,
-        None,
-    )
-    .await?;
+    let game_ids;
+    {
+        let cache_lock = game_ids_cache.lock().await;
+
+        if let Some(ids_cache) = cache_lock.as_ref() {
+            game_ids = GameIds {
+                owned: ids_cache.clone(),
+            };
+        } else {
+            game_ids = fetch_json::<GameIds, String>(
+                "https://embed.gog.com/user/data/games",
+                Some(auth),
+                client,
+                Method::Get,
+                false,
+                None,
+            )
+            .await?;
+        }
+    }
 
     let games = stream::iter(game_ids.owned)
-        .map(|game_id| async move { get_game_details(auth, client, game_id).await })
+        .map(|id| {
+            let cache_clone = game_details_cache.clone();
+            (id, cache_clone)
+        })
+        .map(async move |(id, cache)| get_game_details(auth, client, id, cache).await)
         .buffer_unordered(8)
         .filter_map(|res| async { res.ok() })
         .collect::<Vec<_>>()
@@ -240,11 +258,26 @@ pub async fn get_game_details(
     auth: &Auth,
     client: &reqwest::Client,
     game_id: i32,
+    game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
 ) -> Result<GameDetails, ClientError> {
     let url = format!("https://embed.gog.com/account/gameDetails/{}.json", game_id);
-    let mut game_details =
-        fetch_json::<GameDetails, String>(&url, Some(auth), client, Method::Get, false, None)
-            .await?;
+
+    let mut game_details;
+    let cached = {
+        let cache_lock = game_details_cache.lock().await;
+        cache_lock.get(&game_id).cloned()
+    };
+
+    if let Some(game) = cached {
+        game_details = game;
+    } else {
+        game_details =
+            fetch_json::<GameDetails, String>(&url, Some(auth), client, Method::Get, false, None)
+                .await?;
+
+        let mut cache_lock = game_details_cache.lock().await;
+        cache_lock.insert(game_id, game_details.clone());
+    }
 
     game_details.id = game_id;
     Ok(game_details)
@@ -254,6 +287,7 @@ pub async fn get_game_builds(
     auth: &Auth,
     client: &reqwest::Client,
     game_id: i32,
+    game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
 ) -> Result<GameBuilds, ClientError> {
     let url = format!(
         "https://content-system.gog.com/products/{}/os/windows/builds?generation=2",
@@ -263,7 +297,7 @@ pub async fn get_game_builds(
         fetch_json::<GameBuilds, String>(&url, Some(auth), client, Method::Get, false, None)
             .await?;
 
-    let game_details = get_game_details(auth, client, game_id).await?;
+    let game_details = get_game_details(auth, client, game_id, game_details_cache.clone()).await?;
 
     game_builds.game_title = game_details.title;
     Ok(game_builds)
@@ -274,8 +308,9 @@ pub async fn get_build_metadata(
     client: &reqwest::Client,
     game_id: i32,
     version_name: &str,
+    game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
 ) -> Result<BuildMetadata, ClientError> {
-    let game_builds = get_game_builds(auth, client, game_id).await?;
+    let game_builds = get_game_builds(auth, client, game_id, game_details_cache.clone()).await?;
 
     let game_link = game_builds
         .items
@@ -322,8 +357,16 @@ pub async fn get_build_files(
     client: &reqwest::Client,
     game_id: i32,
     version_name: &str,
+    game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
 ) -> Result<Vec<DepotFile>, ClientError> {
-    let build_metadata = get_build_metadata(auth, client, game_id, version_name).await?;
+    let build_metadata = get_build_metadata(
+        auth,
+        client,
+        game_id,
+        version_name,
+        game_details_cache.clone(),
+    )
+    .await?;
 
     let depot_files: Result<Vec<_>, _> = join_all(
         build_metadata
@@ -354,8 +397,16 @@ pub async fn get_build_chunks(
     client: &reqwest::Client,
     game_id: i32,
     version_name: &str,
+    game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
 ) -> Result<Vec<Chunk>, ClientError> {
-    let build_metadata = get_build_metadata(auth, client, game_id, version_name).await?;
+    let build_metadata = get_build_metadata(
+        auth,
+        client,
+        game_id,
+        version_name,
+        game_details_cache.clone(),
+    )
+    .await?;
 
     let depot_files: Result<Vec<_>, _> = join_all(
         build_metadata
@@ -674,10 +725,18 @@ pub async fn download_game(
     build_name: &str,
     tx: UnboundedSender<i64>,
     path: &str,
+    game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
 ) -> Result<(), ClientError> {
-    let game_files = get_build_files(auth, client, game_id, build_name).await?;
+    let game_files = get_build_files(
+        auth,
+        client,
+        game_id,
+        build_name,
+        game_details_cache.clone(),
+    )
+    .await?;
 
-    let game_details = get_game_details(auth, client, game_id).await?;
+    let game_details = get_game_details(auth, client, game_id, game_details_cache.clone()).await?;
 
     let semaphore = Arc::new(Semaphore::new(36));
     let hashing_semaphore = Arc::new(Semaphore::new(12));
