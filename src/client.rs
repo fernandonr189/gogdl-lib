@@ -102,8 +102,6 @@ where
 
     let body = reqwest::Body::wrap_stream(body_stream);
 
-    println!("Request: {:?}", request);
-
     request = request.body(body);
     let response = request.send().await?;
 
