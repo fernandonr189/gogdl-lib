@@ -38,6 +38,12 @@ pub enum ClientError {
 
     #[error("Hash mismatch")]
     HashMismatch,
+
+    #[error("Token expired")]
+    TokenExpired,
+
+    #[error("Not logged in")]
+    NotLoggedIn,
 }
 
 pub enum Method {

@@ -62,6 +62,15 @@ impl GogDl {
         Ok(auth)
     }
 
+    pub async fn validate_auth(&self) -> Result<(), ClientError> {
+        let auth_lock = self.auth.lock().await;
+        if let Some(auth) = auth_lock.as_ref() {
+            auth.validate_token().await
+        } else {
+            Err(ClientError::NotLoggedIn)
+        }
+    }
+
     pub async fn get_game_details(&self, game_id: i32) -> Result<GameDetails, GogdlError> {
         let auth = {
             let auth_lock = self.auth.lock().await;

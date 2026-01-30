@@ -14,6 +14,8 @@ pub struct Auth {
     pub session_id: String,
     pub scope: Option<String>,
     pub user_id: String,
+    #[serde(skip_deserializing)]
+    pub valid_until: Option<i64>,
 }
 #[derive(Deserialize, Serialize, Clone)]
 pub struct SavesAuth {
@@ -37,7 +39,8 @@ pub async fn get_login_tokens(code: &str, client: &Client) -> Result<Auth, Clien
         "https://auth.gog.com/token?client_id=46899977096215655&client_secret=9d85c43b1482497dbbce61f6e4aa173a433796eeae2ca8c5f6129f2dc4de46d9&grant_type=authorization_code&redirect_uri=https://embed.gog.com/on_login_success?origin=client&code={}",
         code
     );
-    let auth = fetch_json::<Auth, String>(&url, None, client, Method::Get, false, None).await?;
+    let mut auth = fetch_json::<Auth, String>(&url, None, client, Method::Get, false, None).await?;
+    auth.valid_until = Some(auth.expires_in as i64 + chrono::Utc::now().timestamp());
     Ok(auth)
 }
 
@@ -56,5 +59,13 @@ impl Auth {
             fetch_json::<SavesAuth, String>(&url, None, client, Method::Get, false, None).await?;
         auth.client_id = client_id.to_owned();
         Ok(auth)
+    }
+    pub async fn validate_token(&self) -> Result<(), ClientError> {
+        if let Some(valid_until) = self.valid_until {
+            if valid_until > chrono::Utc::now().timestamp() {
+                return Ok(());
+            }
+        }
+        Err(ClientError::TokenExpired)
     }
 }
