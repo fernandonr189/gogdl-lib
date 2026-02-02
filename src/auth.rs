@@ -30,7 +30,8 @@ pub async fn refresh_token(refresh_token: &str, client: &Client) -> Result<Auth,
         "https://auth.gog.com/token?client_id=46899977096215655&client_secret=9d85c43b1482497dbbce61f6e4aa173a433796eeae2ca8c5f6129f2dc4de46d9&grant_type=refresh_token&refresh_token={}",
         refresh_token
     );
-    let auth = fetch_json::<Auth, String>(&url, None, client, Method::Get, false, None).await?;
+    let mut auth = fetch_json::<Auth, String>(&url, None, client, Method::Get, false, None).await?;
+    auth.valid_until = Some(auth.expires_in as i64 + chrono::Utc::now().timestamp());
     Ok(auth)
 }
 

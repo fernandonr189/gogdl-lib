@@ -690,7 +690,6 @@ fn handle_file_downloads(
             }
 
             if !file_valid {
-                println!("\nHash mismatch: Deleting invalid file...");
                 drop(existing_file);
                 tokio::fs::remove_file(path).await?;
             } else {
