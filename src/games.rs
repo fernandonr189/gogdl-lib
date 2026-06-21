@@ -204,7 +204,9 @@ impl SecureLinksManager {
         }
 
         // Fetch new links for this product_id
-        let product_id_int: i32 = product_id.parse().map_err(|_| ClientError::NotFound)?;
+        let product_id_int: i32 = product_id
+            .parse()
+            .map_err(|_| ClientError::InvalidProductId(product_id.to_string()))?;
         let new_links = get_secure_links(&self.auth, &self.client, product_id_int).await?;
         cache.insert(product_id.to_string(), new_links.clone());
 
@@ -331,7 +333,10 @@ pub async fn get_build_metadata(
         .await?;
         Ok(build_metadata)
     } else {
-        Err(ClientError::NotFound)
+        Err(ClientError::BuildNotFound(format!(
+            "no version named {:?}",
+            version_name
+        )))
     }
 }
 
@@ -500,7 +505,8 @@ pub async fn get_secure_links(
 }
 
 fn parse_product_id(s: &str) -> Result<i32, ClientError> {
-    s.parse::<i32>().map_err(|_| ClientError::NotFound)
+    s.parse::<i32>()
+        .map_err(|_| ClientError::InvalidProductId(s.to_string()))
 }
 
 fn select_max_priority_url(urls: &[UrlFormat]) -> Result<&UrlFormat, ClientError> {
@@ -557,11 +563,14 @@ async fn handle_chunk_download(
     match res {
         Ok(downloaded_chunk) => {
             let digest = md5::compute(&downloaded_chunk);
-            if format!("{:x}", digest) != chunk.md5 {
-                println!("Hash mismatch: {:x} != {}", digest, chunk.md5);
+            let actual = format!("{:x}", digest);
+            if actual != chunk.md5 {
                 let downloaded = bytes_clone.swap(0, Ordering::Relaxed);
                 let _ = tx.send(-downloaded);
-                return Err(ClientError::HashMismatch);
+                return Err(ClientError::HashMismatch {
+                    expected: chunk.md5.clone(),
+                    actual,
+                });
             } else {
                 Ok(downloaded_chunk)
             }
@@ -695,8 +704,6 @@ fn handle_file_downloads(
                 if let Some(chunks) = &file.chunks {
                     let size: u64 = chunks.iter().map(|chunk| chunk.compressed_size).sum();
                     let _ = tx_clone.send(size as i64);
-                } else {
-                    println!("File is valid, but progress reporting may lie");
                 }
                 return Ok(());
             }
@@ -734,7 +741,6 @@ fn handle_file_downloads(
                         retries += 1;
                         tokio::time::sleep(Duration::from_millis(200 * retries as u64)).await;
                         if retries >= MAX_RETRIES {
-                            eprintln!("Failed to download chunk: {}", err);
                             let _ = tokio::fs::remove_file(path).await;
                             return Err(err);
                         }
@@ -748,9 +754,12 @@ fn handle_file_downloads(
         // Verify hash
         if let Some(file_md5) = file.md5 {
             let digest = md5_ctx.finalize();
-            if format!("{:x}", digest) != file_md5 {
-                println!("Hash mismatch: {:x} != {}", digest, file_md5);
-                return Err(ClientError::HashMismatch);
+            let actual = format!("{:x}", digest);
+            if actual != file_md5 {
+                return Err(ClientError::HashMismatch {
+                    expected: file_md5,
+                    actual,
+                });
             }
         }
         if let Some(file_sha256) = file.sha256 {
@@ -758,8 +767,10 @@ fn handle_file_downloads(
             let hash_bytes: [u8; 32] = sha_digest.into();
             let hash_hex = hex::encode(hash_bytes);
             if hash_hex != file_sha256 {
-                println!("Hash mismatch: {} != {}", hash_hex, file_sha256);
-                return Err(ClientError::HashMismatch);
+                return Err(ClientError::HashMismatch {
+                    expected: file_sha256,
+                    actual: hash_hex,
+                });
             }
         }
         Ok(())
@@ -909,10 +920,11 @@ mod tests {
 
     #[test]
     fn parse_product_id_rejects_non_numeric_string() {
-        assert!(matches!(
-            parse_product_id("abc"),
-            Err(ClientError::NotFound)
-        ));
+        let result = parse_product_id("abc");
+        match result {
+            Err(ClientError::InvalidProductId(s)) => assert_eq!(s, "abc"),
+            other => panic!("expected InvalidProductId, got {other:?}"),
+        }
     }
 
     #[test]

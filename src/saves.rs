@@ -84,16 +84,18 @@ impl RemoteConfig {
         let gog_path = self.content.windows.cloud_storage.locations[0]
             .location
             .clone();
-        let (placeholder, remainder) = gog_path.split_once('>').ok_or(ClientError::NotFound)?;
+        let (placeholder, remainder) = gog_path
+            .split_once('>')
+            .ok_or_else(|| ClientError::MalformedRemotePath(gog_path.clone()))?;
 
         let folder_key = placeholder
             .strip_prefix("<?")
-            .ok_or(ClientError::NotFound)?
+            .ok_or_else(|| ClientError::MalformedRemotePath(gog_path.clone()))?
             .strip_suffix("?")
-            .ok_or(ClientError::NotFound)?;
+            .ok_or_else(|| ClientError::MalformedRemotePath(gog_path.clone()))?;
         let mapped = map
             .get(folder_key)
-            .ok_or(ClientError::NotFound)?
+            .ok_or_else(|| ClientError::UnknownFolderKey(folder_key.to_string()))?
             .to_string();
 
         let mut path_buf = PathBuf::new();
@@ -135,7 +137,7 @@ fn first_build_link(items: &[GameBuild]) -> Result<&str, ClientError> {
     items
         .first()
         .map(|build| build.link.as_str())
-        .ok_or(ClientError::NotFound)
+        .ok_or_else(|| ClientError::BuildNotFound("no builds exist for this game".to_string()))
 }
 
 pub async fn get_auth_ids(
@@ -170,8 +172,12 @@ impl SaveFile {
 
 fn verify_md5(data: &[u8], expected_hex: &str) -> Result<(), ClientError> {
     let digest = md5::compute(data);
-    if format!("{:x}", digest) != expected_hex {
-        Err(ClientError::HashMismatch)
+    let actual = format!("{:x}", digest);
+    if actual != expected_hex {
+        Err(ClientError::HashMismatch {
+            expected: expected_hex.to_string(),
+            actual,
+        })
     } else {
         Ok(())
     }
@@ -209,33 +215,13 @@ pub async fn download_file(
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let mut file = match tokio::fs::File::create(path).await {
-        Ok(f) => f,
-        Err(err) => {
-            println!("\nPath: {:?}", path);
-            println!("Error: {}", err);
-            return Err(ClientError::NotFound);
-        }
-    };
-
-    match file.write_all(&decoded_buffer).await {
-        Ok(_) => (),
-        Err(err) => {
-            println!("\nPath: {:?}", path);
-            println!("Error: {}", err);
-            return Err(ClientError::NotFound);
-        }
-    };
-    match file.flush().await {
-        Ok(_) => (),
-        Err(err) => {
-            println!("\nPath: {:?}", path);
-            println!("Error: {}", err);
-            return Err(ClientError::NotFound);
-        }
-    };
+    let mut file = tokio::fs::File::create(path).await?;
+    file.write_all(&decoded_buffer).await?;
+    file.flush().await?;
     if let Some(timestamp) = last_modified {
-        let dt: DateTime<FixedOffset> = timestamp.parse().map_err(|_err| ClientError::NotFound)?;
+        let dt: DateTime<FixedOffset> = timestamp
+            .parse()
+            .map_err(|_| ClientError::InvalidTimestamp(timestamp.clone()))?;
         let file_time = FileTime::from_unix_time(dt.timestamp(), dt.timestamp_subsec_nanos());
         set_file_times(path, file_time, file_time)?;
     }
@@ -308,7 +294,7 @@ fn parse_save_files_list(response: &str) -> Result<Vec<SaveFile>, ClientError> {
             if line.starts_with("saves/") {
                 Ok(SaveFile(line.to_string()))
             } else {
-                Err(ClientError::NotFound)
+                Err(ClientError::MalformedSaveLine(line.to_string()))
             }
         })
         .collect()
@@ -329,7 +315,10 @@ mod tests {
     fn parse_save_files_list_fails_on_malformed_line() {
         let response = "saves/foo/bar.sav\nnot-a-save-line";
         let result = parse_save_files_list(response);
-        assert!(matches!(result, Err(ClientError::NotFound)));
+        match result {
+            Err(ClientError::MalformedSaveLine(line)) => assert_eq!(line, "not-a-save-line"),
+            other => panic!("expected MalformedSaveLine, got {other:?}"),
+        }
     }
 
     #[test]
@@ -351,7 +340,7 @@ mod tests {
         let items: Vec<GameBuild> = Vec::new();
         assert!(matches!(
             first_build_link(&items),
-            Err(ClientError::NotFound)
+            Err(ClientError::BuildNotFound(_))
         ));
     }
 
@@ -367,7 +356,13 @@ mod tests {
     fn verify_md5_errors_when_mismatched() {
         let data = b"hello world";
         let result = verify_md5(data, "0000000000000000000000000000000");
-        assert!(matches!(result, Err(ClientError::HashMismatch)));
+        match result {
+            Err(ClientError::HashMismatch { expected, actual }) => {
+                assert_eq!(expected, "0000000000000000000000000000000");
+                assert_ne!(actual, expected);
+            }
+            other => panic!("expected HashMismatch, got {other:?}"),
+        }
     }
 
     #[test]

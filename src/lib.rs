@@ -241,7 +241,7 @@ impl GogDl {
         let remote_config = saves::get_remote_config(&self.client, client_id).await?;
         Ok(remote_config)
     }
-    pub async fn get_auth_ids(&self, game_id: i32) -> Result<(String, String), ClientError> {
+    pub async fn get_auth_ids(&self, game_id: i32) -> Result<(String, String), GogdlError> {
         let auth = {
             let auth_lock = self.auth.lock().await;
             auth_lock.clone()
@@ -252,14 +252,14 @@ impl GogDl {
                     .await?;
             Ok(auth_ids)
         } else {
-            return Err(ClientError::NotFound);
+            return Err(GogdlError::NotLoggedIn);
         }
     }
     pub async fn get_save_file_list(
         &self,
         client_id: &str,
         client_secret: &str,
-    ) -> Result<Vec<SaveFile>, ClientError> {
+    ) -> Result<Vec<SaveFile>, GogdlError> {
         let auth = {
             let auth_lock = self.auth.lock().await;
             auth_lock.clone()
@@ -271,7 +271,7 @@ impl GogDl {
             let response = saves::get_save_files_list(&self.client, client_id, &saves_auth).await?;
             Ok(response)
         } else {
-            Err(ClientError::NotFound)
+            Err(GogdlError::NotLoggedIn)
         }
     }
     pub async fn upload_save_file(
@@ -281,7 +281,7 @@ impl GogDl {
         tx: UnboundedSender<(i64, i64)>,
         path: &PathBuf,
         url_path: &str,
-    ) -> Result<(), ClientError> {
+    ) -> Result<(), GogdlError> {
         let auth = {
             let auth_lock = self.auth.lock().await;
             auth_lock.clone()
@@ -293,7 +293,7 @@ impl GogDl {
             saves::upload_file(&self.client, &saves_auth, path, &url_path, tx).await?;
             Ok(())
         } else {
-            Err(ClientError::NotFound)
+            Err(GogdlError::NotLoggedIn)
         }
     }
     pub async fn download_save_file(
@@ -303,7 +303,7 @@ impl GogDl {
         client_secret: &str,
         tx: UnboundedSender<(i64, i64)>,
         path: &PathBuf,
-    ) -> Result<(), ClientError> {
+    ) -> Result<(), GogdlError> {
         let auth = {
             let auth_lock = self.auth.lock().await;
             auth_lock.clone()
@@ -315,7 +315,7 @@ impl GogDl {
             saves::download_file(save_file, &saves_auth, &self.client, tx, path).await?;
             Ok(())
         } else {
-            Err(ClientError::NotFound)
+            Err(GogdlError::NotLoggedIn)
         }
     }
 }

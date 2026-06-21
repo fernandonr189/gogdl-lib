@@ -27,8 +27,8 @@ pub enum ClientError {
     #[error("Could not find requested resource")]
     NotFound,
 
-    #[error("Decode error: {0}")]
-    DecodeError(#[from] std::io::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 
     #[error("Async error: {0}")]
     AsyncError(#[from] JoinError),
@@ -36,8 +36,8 @@ pub enum ClientError {
     #[error("Semaphore error: {0}")]
     SemaphoreError(#[from] AcquireError),
 
-    #[error("Hash mismatch")]
-    HashMismatch,
+    #[error("Hash mismatch: expected {expected}, got {actual}")]
+    HashMismatch { expected: String, actual: String },
 
     #[error("Token expired")]
     TokenExpired,
@@ -50,6 +50,24 @@ pub enum ClientError {
 
     #[error("Truncated download: expected {expected} bytes, got {actual}")]
     TruncatedDownload { expected: usize, actual: usize },
+
+    #[error("Invalid product ID {0:?}: expected a numeric string")]
+    InvalidProductId(String),
+
+    #[error("No build found ({0})")]
+    BuildNotFound(String),
+
+    #[error("Malformed cloud-storage path placeholder: {0:?}")]
+    MalformedRemotePath(String),
+
+    #[error("Unknown known-folder key {0:?} in remote config")]
+    UnknownFolderKey(String),
+
+    #[error("Invalid timestamp {0:?}: not a valid RFC3339 date")]
+    InvalidTimestamp(String),
+
+    #[error("Malformed save-file listing line: {0:?}")]
+    MalformedSaveLine(String),
 }
 
 fn header_to_str(value: &reqwest::header::HeaderValue) -> Result<&str, ClientError> {
