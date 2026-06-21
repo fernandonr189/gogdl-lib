@@ -415,7 +415,7 @@ pub async fn get_build_files(
             if let (Some(owned_ids), Some(file_product_id)) =
                 (cache.as_ref(), file.product_id.as_ref())
             {
-                let file_id_int = file_product_id.parse::<i32>().unwrap();
+                let file_id_int = parse_product_id(file_product_id)?;
                 if owned_ids.contains(&file_id_int) {
                     files.push(file);
                 }
@@ -470,7 +470,7 @@ pub async fn get_build_chunks(
     for info in depot_files {
         for file in info.depot.items {
             if let (Some(ids), Some(file_id)) = (cache.as_ref(), file.product_id) {
-                let file_id_int = file_id.parse::<i32>().unwrap();
+                let file_id_int = parse_product_id(&file_id)?;
                 if ids.contains(&file_id_int) {
                     if let Some(chunks) = file.chunks {
                         build_chunks.extend(chunks);
@@ -499,6 +499,16 @@ pub async fn get_secure_links(
     Ok(secure_links)
 }
 
+fn parse_product_id(s: &str) -> Result<i32, ClientError> {
+    s.parse::<i32>().map_err(|_| ClientError::NotFound)
+}
+
+fn select_max_priority_url(urls: &[UrlFormat]) -> Result<&UrlFormat, ClientError> {
+    urls.iter()
+        .max_by_key(|link| link.priority)
+        .ok_or(ClientError::NotFound)
+}
+
 async fn handle_chunk_download(
     chunk: &Chunk,
     secure_links_manager: &Arc<SecureLinksManager>,
@@ -511,18 +521,7 @@ async fn handle_chunk_download(
         .get_links_for_product(product_id)
         .await?;
 
-    let max_priority = secure_links
-        .urls
-        .iter()
-        .map(|link| link.priority)
-        .max()
-        .unwrap_or(0);
-
-    let url_format = secure_links
-        .urls
-        .iter()
-        .find(|link| link.priority == max_priority)
-        .expect("no secure link with max priority");
+    let url_format = select_max_priority_url(&secure_links.urls)?;
 
     let url = url_format.parse_url(&chunk.compressed_md5);
     let alternate_url = url_format.parse_url_redist(&chunk.compressed_md5);
@@ -877,5 +876,58 @@ impl UrlFormat {
             // Fallback to simple concatenation if URL parsing fails
             format!("{}/{}", url.trim_end_matches('/'), galaxy_path)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_url_format(priority: u64) -> UrlFormat {
+        UrlFormat {
+            endpoint_name: "test".to_string(),
+            url_format: "{base_url}".to_string(),
+            priority,
+            parameters: CdnUrlParams {
+                base_url: "https://example.com".to_string(),
+                path: String::new(),
+                token: String::new(),
+                expires_at: None,
+                dirs: None,
+                ttl: None,
+                source: None,
+                gog_token: None,
+                l: None,
+            },
+        }
+    }
+
+    #[test]
+    fn parse_product_id_accepts_numeric_string() {
+        assert_eq!(parse_product_id("123").unwrap(), 123);
+    }
+
+    #[test]
+    fn parse_product_id_rejects_non_numeric_string() {
+        assert!(matches!(
+            parse_product_id("abc"),
+            Err(ClientError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn select_max_priority_url_errors_on_empty_slice() {
+        let urls: Vec<UrlFormat> = Vec::new();
+        assert!(matches!(
+            select_max_priority_url(&urls),
+            Err(ClientError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn select_max_priority_url_picks_highest_priority() {
+        let urls = vec![make_url_format(1), make_url_format(5), make_url_format(3)];
+        let selected = select_max_priority_url(&urls).unwrap();
+        assert_eq!(selected.priority, 5);
     }
 }

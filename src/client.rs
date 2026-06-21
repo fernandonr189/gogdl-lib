@@ -44,6 +44,32 @@ pub enum ClientError {
 
     #[error("Not logged in")]
     NotLoggedIn,
+
+    #[error("Invalid header value: {0}")]
+    InvalidHeader(String),
+
+    #[error("Truncated download: expected {expected} bytes, got {actual}")]
+    TruncatedDownload { expected: usize, actual: usize },
+}
+
+fn header_to_str(value: &reqwest::header::HeaderValue) -> Result<&str, ClientError> {
+    value
+        .to_str()
+        .map_err(|e| ClientError::InvalidHeader(e.to_string()))
+}
+
+fn parse_content_length(value: &reqwest::header::HeaderValue) -> Result<usize, ClientError> {
+    header_to_str(value)?
+        .parse::<usize>()
+        .map_err(|_| ClientError::InvalidHeader(format!("invalid content-length: {:?}", value)))
+}
+
+fn check_content_length(actual: usize, expected: usize) -> Result<(), ClientError> {
+    if actual != expected {
+        Err(ClientError::TruncatedDownload { expected, actual })
+    } else {
+        Ok(())
+    }
 }
 
 pub enum Method {
@@ -159,11 +185,9 @@ where
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(downloaded_bytes) => {
-                if let Some(lenght) = content_length {
-                    callback(
-                        downloaded_bytes.len() as i64,
-                        lenght.to_str().unwrap().parse::<i64>().unwrap(),
-                    );
+                if let Some(length) = content_length {
+                    let expected = parse_content_length(length)?;
+                    callback(downloaded_bytes.len() as i64, expected as i64);
                 }
                 buffer.extend_from_slice(&downloaded_bytes);
             }
@@ -171,20 +195,16 @@ where
         }
     }
     if let Some(len) = content_length {
-        let expected = len.to_str().unwrap().parse::<usize>().unwrap();
-        if buffer.len() != expected {
-            println!(
-                "Truncated download: got {}, expected {}",
-                buffer.len(),
-                expected
-            );
-            panic!()
-        }
+        let expected = parse_content_length(len)?;
+        check_content_length(buffer.len(), expected)?;
     }
 
-    let last_modified = last_modified.map(|h| h.to_str().unwrap().to_owned());
+    let last_modified = last_modified
+        .map(header_to_str)
+        .transpose()?
+        .map(|s| s.to_owned());
     if let Some(md5_header) = etag {
-        let md5 = md5_header.to_str().unwrap();
+        let md5 = header_to_str(md5_header)?;
         Ok((buffer, Some(md5.to_owned()), last_modified))
     } else {
         Ok((buffer, None, last_modified))
@@ -342,5 +362,58 @@ where
             }
         };
         Ok(data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::HeaderValue;
+
+    #[test]
+    fn header_to_str_accepts_valid_ascii() {
+        let value = HeaderValue::from_static("12345");
+        assert_eq!(header_to_str(&value).unwrap(), "12345");
+    }
+
+    #[test]
+    fn header_to_str_rejects_non_ascii_bytes() {
+        let value = HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap();
+        assert!(matches!(
+            header_to_str(&value),
+            Err(ClientError::InvalidHeader(_))
+        ));
+    }
+
+    #[test]
+    fn parse_content_length_accepts_valid_number() {
+        let value = HeaderValue::from_static("12345");
+        assert_eq!(parse_content_length(&value).unwrap(), 12345);
+    }
+
+    #[test]
+    fn parse_content_length_rejects_non_numeric() {
+        let value = HeaderValue::from_static("not-a-number");
+        assert!(matches!(
+            parse_content_length(&value),
+            Err(ClientError::InvalidHeader(_))
+        ));
+    }
+
+    #[test]
+    fn check_content_length_ok_when_matching() {
+        assert!(check_content_length(100, 100).is_ok());
+    }
+
+    #[test]
+    fn check_content_length_errors_when_mismatched() {
+        let err = check_content_length(50, 100).unwrap_err();
+        assert!(matches!(
+            err,
+            ClientError::TruncatedDownload {
+                expected: 100,
+                actual: 50
+            }
+        ));
     }
 }

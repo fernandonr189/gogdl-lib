@@ -21,7 +21,7 @@ use tokio::{
 use crate::{
     auth::{Auth, SavesAuth},
     client::{ClientError, fetch_json, fetch_plain, fetch_save_file, upload_save_file},
-    games::{BuildMetadata, GameDetails, get_game_builds},
+    games::{BuildMetadata, GameBuild, GameDetails, get_game_builds},
 };
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -131,6 +131,13 @@ pub async fn get_remote_config(
     Ok(response)
 }
 
+fn first_build_link(items: &[GameBuild]) -> Result<&str, ClientError> {
+    items
+        .first()
+        .map(|build| build.link.as_str())
+        .ok_or(ClientError::NotFound)
+}
+
 pub async fn get_auth_ids(
     client: &Client,
     game_id: i32,
@@ -138,7 +145,7 @@ pub async fn get_auth_ids(
     game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
 ) -> Result<(String, String), ClientError> {
     let game_builds = get_game_builds(auth, client, game_id, game_details_cache.clone()).await?;
-    let game_build_link = &game_builds.items[0].link;
+    let game_build_link = first_build_link(&game_builds.items)?;
 
     let auth_ids = fetch_json::<BuildMetadata, String>(
         game_build_link,
@@ -157,7 +164,16 @@ pub struct SaveFile(String);
 
 impl SaveFile {
     pub fn get_path(&self) -> String {
-        self.0.clone().strip_prefix("saves/").unwrap().to_owned()
+        self.0.strip_prefix("saves/").unwrap_or(&self.0).to_owned()
+    }
+}
+
+fn verify_md5(data: &[u8], expected_hex: &str) -> Result<(), ClientError> {
+    let digest = md5::compute(data);
+    if format!("{:x}", digest) != expected_hex {
+        Err(ClientError::HashMismatch)
+    } else {
+        Ok(())
     }
 }
 
@@ -182,8 +198,7 @@ pub async fn download_file(
         .await?;
 
     if let Some(hash) = md5 {
-        let digest = md5::compute(&file_data);
-        assert_eq!(format!("{:x}", digest), hash);
+        verify_md5(&file_data, &hash)?;
     }
 
     let mut decoded_buffer = Vec::new();
@@ -283,10 +298,81 @@ pub async fn get_save_files_list(
     )
     .await?;
 
-    let save_files: Vec<SaveFile> = response
-        .lines()
-        .map(|line| SaveFile(line.to_string()))
-        .collect();
+    parse_save_files_list(&response)
+}
 
-    Ok(save_files)
+fn parse_save_files_list(response: &str) -> Result<Vec<SaveFile>, ClientError> {
+    response
+        .lines()
+        .map(|line| {
+            if line.starts_with("saves/") {
+                Ok(SaveFile(line.to_string()))
+            } else {
+                Err(ClientError::NotFound)
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_save_files_list_accepts_valid_lines() {
+        let response = "saves/foo/bar.sav\nsaves/baz.sav";
+        let files = parse_save_files_list(response).unwrap();
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn parse_save_files_list_fails_on_malformed_line() {
+        let response = "saves/foo/bar.sav\nnot-a-save-line";
+        let result = parse_save_files_list(response);
+        assert!(matches!(result, Err(ClientError::NotFound)));
+    }
+
+    #[test]
+    fn first_build_link_returns_first_item() {
+        let items = vec![GameBuild {
+            build_id: "1".to_string(),
+            version_name: "v1".to_string(),
+            date_published: "2026-01-01".to_string(),
+            link: "https://example.com/build".to_string(),
+        }];
+        assert_eq!(
+            first_build_link(&items).unwrap(),
+            "https://example.com/build"
+        );
+    }
+
+    #[test]
+    fn first_build_link_errors_on_empty_slice() {
+        let items: Vec<GameBuild> = Vec::new();
+        assert!(matches!(
+            first_build_link(&items),
+            Err(ClientError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn verify_md5_ok_when_matching() {
+        let data = b"hello world";
+        let digest = md5::compute(data);
+        let hex = format!("{:x}", digest);
+        assert!(verify_md5(data, &hex).is_ok());
+    }
+
+    #[test]
+    fn verify_md5_errors_when_mismatched() {
+        let data = b"hello world";
+        let result = verify_md5(data, "0000000000000000000000000000000");
+        assert!(matches!(result, Err(ClientError::HashMismatch)));
+    }
+
+    #[test]
+    fn get_path_strips_saves_prefix() {
+        let save_file = SaveFile("saves/foo/bar.sav".to_string());
+        assert_eq!(save_file.get_path(), "foo/bar.sav");
+    }
 }
