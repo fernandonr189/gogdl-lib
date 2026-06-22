@@ -17,12 +17,42 @@ pub struct Auth {
     #[serde(skip_deserializing)]
     pub valid_until: Option<i64>,
 }
+
+// Hand-written instead of derived: a naive derive would print the live
+// access_token/refresh_token verbatim, leaking credentials into any log
+// that uses `{:?}`.
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Auth")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .field("token_type", &self.token_type)
+            .field("session_id", &self.session_id)
+            .field("scope", &self.scope)
+            .field("user_id", &self.user_id)
+            .field("valid_until", &self.valid_until)
+            .finish()
+    }
+}
+
 #[derive(Deserialize, Serialize, Clone)]
 pub struct SavesAuth {
     pub access_token: String,
     pub user_id: String,
     #[serde(skip)]
     pub client_id: String,
+}
+
+// See the note on `Auth`'s manual Debug impl above — same reasoning.
+impl std::fmt::Debug for SavesAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SavesAuth")
+            .field("access_token", &"<redacted>")
+            .field("user_id", &self.user_id)
+            .field("client_id", &self.client_id)
+            .finish()
+    }
 }
 
 pub async fn refresh_token(refresh_token: &str, client: &Client) -> Result<Auth, ClientError> {

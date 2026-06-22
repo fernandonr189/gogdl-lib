@@ -19,6 +19,7 @@ pub mod client;
 pub mod games;
 pub mod saves;
 
+#[derive(Debug)]
 pub struct GogDl {
     auth: Mutex<Option<Auth>>,
     client: reqwest::Client,
@@ -216,7 +217,7 @@ impl GogDl {
         &self,
         game_id: i32,
         version_name: &str,
-        tx: UnboundedSender<i64>,
+        tx: UnboundedSender<(i64, i64)>,
         path: &str,
         os: OperatingSystem,
         cancellation_token: CancellationToken,

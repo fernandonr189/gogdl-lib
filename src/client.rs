@@ -94,6 +94,7 @@ fn check_content_length(actual: usize, expected: usize) -> Result<(), ClientErro
     }
 }
 
+#[derive(Debug)]
 pub enum Method {
     Post,
     Get,

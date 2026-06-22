@@ -66,19 +66,19 @@ impl Default for DownloadOptions {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct GameIds {
     pub owned: Vec<i32>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GameDetails {
     pub title: String,
     #[serde(skip)]
     pub id: i32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct GameBuild {
     pub build_id: String,
     pub version_name: String,
@@ -86,7 +86,7 @@ pub struct GameBuild {
     pub link: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct GameBuilds {
     #[serde(skip)]
     pub game_title: String,
@@ -114,7 +114,7 @@ pub struct BuildMetadata {
     pub client_secret: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Chunk {
     pub md5: String,
     pub size: u64,
@@ -124,7 +124,7 @@ pub struct Chunk {
     pub compressed_size: u64,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DepotFile {
     pub md5: Option<String>,
     pub sha256: Option<String>,
@@ -137,17 +137,17 @@ pub struct DepotFile {
     pub product_id: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DepotItems {
     pub items: Vec<DepotFile>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DepotInfo {
     pub depot: DepotItems,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CdnUrlParams {
     pub base_url: String,
     pub path: String,
@@ -160,7 +160,7 @@ pub struct CdnUrlParams {
     pub l: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UrlFormat {
     pub endpoint_name: String,
     pub url_format: String,
@@ -168,13 +168,14 @@ pub struct UrlFormat {
     pub parameters: CdnUrlParams,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SecureLinks {
     pub product_id: u64,
     pub urls: Vec<UrlFormat>,
 }
 
 /// Wrapper that manages secure links with automatic refresh when expired
+#[derive(Debug)]
 pub struct SecureLinksManager {
     auth: Auth,
     client: Client,
@@ -422,7 +423,7 @@ pub async fn get_build_files(
         cache_lock.clone()
     };
 
-    if let None = cache {
+    if cache.is_none() {
         let _ = get_owned_games(
             auth,
             client,
@@ -512,7 +513,7 @@ pub async fn get_build_chunks(
         cache_lock.clone()
     };
 
-    if let None = cache {
+    if cache.is_none() {
         let _ = get_owned_games(auth, client, game_ids_cache.clone(), game_details_cache).await?;
         let cache_lock = game_ids_cache.lock().await;
         cache = cache_lock.clone();
@@ -567,7 +568,9 @@ async fn handle_chunk_download(
     secure_links_manager: &Arc<SecureLinksManager>,
     product_id: &str,
     client: &reqwest::Client,
-    tx: &UnboundedSender<i64>,
+    tx: &UnboundedSender<(i64, i64)>,
+    downloaded_total: &Arc<AtomicI64>,
+    total_size: i64,
 ) -> Result<Vec<u8>, ClientError> {
     // Get fresh links for this product (will refresh if expired)
     let secure_links = secure_links_manager
@@ -583,24 +586,29 @@ async fn handle_chunk_download(
     let bytes_clone = downloaded_bytes.clone();
     let res = match fetch_chunk(&url, None, &client, |f| {
         bytes_clone.fetch_add(f, Ordering::Relaxed);
-        let _ = tx.send(f);
+        let total_now = downloaded_total.fetch_add(f, Ordering::Relaxed) + f;
+        let _ = tx.send((total_now, total_size));
     })
     .await
     {
         Ok(chunk) => Ok(chunk),
         Err(_primary_err) => {
             let downloaded = bytes_clone.swap(0, Ordering::Relaxed);
-            let _ = tx.send(-downloaded);
+            let total_now = downloaded_total.fetch_sub(downloaded, Ordering::Relaxed) - downloaded;
+            let _ = tx.send((total_now, total_size));
             match fetch_chunk(&alternate_url, None, &client, |f| {
                 bytes_clone.fetch_add(f, Ordering::Relaxed);
-                let _ = tx.send(f);
+                let total_now = downloaded_total.fetch_add(f, Ordering::Relaxed) + f;
+                let _ = tx.send((total_now, total_size));
             })
             .await
             {
                 Ok(chunk) => Ok(chunk),
                 Err(err) => {
                     let downloaded = bytes_clone.swap(0, Ordering::Relaxed);
-                    let _ = tx.send(-downloaded);
+                    let total_now =
+                        downloaded_total.fetch_sub(downloaded, Ordering::Relaxed) - downloaded;
+                    let _ = tx.send((total_now, total_size));
                     Err(err)
                 }
             }
@@ -613,7 +621,9 @@ async fn handle_chunk_download(
             let actual = format!("{:x}", digest);
             if actual != chunk.md5 {
                 let downloaded = bytes_clone.swap(0, Ordering::Relaxed);
-                let _ = tx.send(-downloaded);
+                let total_now =
+                    downloaded_total.fetch_sub(downloaded, Ordering::Relaxed) - downloaded;
+                let _ = tx.send((total_now, total_size));
                 return Err(ClientError::HashMismatch {
                     expected: chunk.md5.clone(),
                     actual,
@@ -682,11 +692,13 @@ fn handle_file_downloads(
     hashing_semaphore: Arc<Semaphore>,
     secure_links_manager: Arc<SecureLinksManager>,
     client: &Client,
-    tx: &UnboundedSender<i64>,
+    tx: &UnboundedSender<(i64, i64)>,
     file: DepotFile,
     path: &str,
     game_name: &str,
     cancellation_token: CancellationToken,
+    downloaded_total: Arc<AtomicI64>,
+    total_size: i64,
 ) -> JoinHandle<Result<(), ClientError>> {
     let client = client.clone();
     let tx_clone = tx.clone();
@@ -755,7 +767,9 @@ fn handle_file_downloads(
             } else {
                 if let Some(chunks) = &file.chunks {
                     let size: u64 = chunks.iter().map(|chunk| chunk.compressed_size).sum();
-                    let _ = tx_clone.send(size as i64);
+                    let total_now =
+                        downloaded_total.fetch_add(size as i64, Ordering::Relaxed) + size as i64;
+                    let _ = tx_clone.send((total_now, total_size));
                 }
                 return Ok(());
             }
@@ -789,6 +803,8 @@ fn handle_file_downloads(
                         product_id,
                         &client,
                         &tx_clone,
+                        &downloaded_total,
+                        total_size,
                     ) => result,
                 };
                 match result {
@@ -845,7 +861,7 @@ pub async fn download_game(
     game_id: i32,
     os: OperatingSystem,
     build_name: &str,
-    tx: UnboundedSender<i64>,
+    tx: UnboundedSender<(i64, i64)>,
     path: &str,
     game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
     game_ids_cache: Arc<Mutex<Option<Vec<i32>>>>,
@@ -869,6 +885,14 @@ pub async fn download_game(
 
     let game_details = get_game_details(auth, client, game_id, game_details_cache.clone()).await?;
 
+    let total_size: i64 = game_files
+        .iter()
+        .filter_map(|f| f.chunks.as_ref())
+        .flat_map(|chunks| chunks.iter())
+        .map(|chunk| chunk.compressed_size as i64)
+        .sum();
+    let downloaded_total = Arc::new(AtomicI64::new(0));
+
     let semaphore = Arc::new(Semaphore::new(options.max_concurrent_files));
     let hashing_semaphore = Arc::new(Semaphore::new(options.max_concurrent_hashing));
 
@@ -891,6 +915,8 @@ pub async fn download_game(
                 path,
                 &game_details.title,
                 cancellation_token.clone(),
+                downloaded_total.clone(),
+                total_size,
             );
             handles.push(handle);
         }
