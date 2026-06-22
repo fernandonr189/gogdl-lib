@@ -8,8 +8,8 @@ use crate::{
     auth::{Auth, get_login_tokens, refresh_token},
     client::ClientError,
     games::{
-        BuildMetadata, Chunk, DepotFile, DownloadOptions, GameBuilds, GameDetails, OperatingSystem,
-        SecureLinks,
+        BuildMetadata, Chunk, DepotFile, DownloadEstimate, DownloadOptions, GameBuilds,
+        GameDetails, OperatingSystem, SecureLinks,
     },
     saves::{RemoteConfig, SaveFile},
 };
@@ -245,6 +245,34 @@ impl GogDl {
             Ok(res)
         } else {
             return Err(GogdlError::NotLoggedIn);
+        }
+    }
+    pub async fn estimate_download(
+        &self,
+        game_id: i32,
+        os: OperatingSystem,
+        version_name: &str,
+        path: &str,
+    ) -> Result<DownloadEstimate, GogdlError> {
+        let auth = {
+            let auth_lock = self.auth.lock().await;
+            auth_lock.clone()
+        };
+        if let Some(auth) = auth.as_ref() {
+            let estimate = games::estimate_download(
+                auth,
+                &self.client,
+                game_id,
+                os,
+                version_name,
+                path,
+                self.game_details_cache.clone(),
+                self.game_ids_cache.clone(),
+            )
+            .await?;
+            Ok(estimate)
+        } else {
+            Err(GogdlError::NotLoggedIn)
         }
     }
     pub async fn get_build_chunks(

@@ -22,7 +22,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::{Mutex, RwLock, Semaphore, mpsc::UnboundedSender},
     task::JoinHandle,
 };
@@ -636,54 +636,66 @@ async fn handle_chunk_download(
     }
 }
 
-async fn hash_file_md5(file: &mut tokio::fs::File) -> Result<md5::Digest, std::io::Error> {
-    let mut md5_ctx = md5::Context::new();
-
-    let buf_size = match file.metadata().await?.len() {
-        s if s < 256 * 1024 => 64 * 1024,       // tiny files
-        s if s < 8 * 1024 * 1024 => 256 * 1024, // small
-        _ => 2 * 1024 * 1024,                   // large
+/// Checks how many leading chunks of `chunks` are already present and
+/// hash-correct at `path`, stopping at the first chunk that doesn't fully
+/// verify (file too short, or a hash mismatch). Stateless: re-derives the
+/// answer from disk + the manifest's chunk hashes every call, no sidecar
+/// state. Returns `(verified_chunk_count, verified_byte_length)`; a missing
+/// file returns `(0, 0)`.
+async fn verify_existing_chunks(
+    path: &Path,
+    chunks: &[Chunk],
+) -> Result<(usize, u64), ClientError> {
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(_) => return Ok((0, 0)),
     };
 
-    let mut buffer = vec![0u8; buf_size];
+    let mut offset: u64 = 0;
+    let mut verified_chunks = 0usize;
+    let mut buffer = Vec::new();
 
-    loop {
-        let n = file.read(&mut buffer).await?;
-        if n == 0 {
+    for chunk in chunks {
+        buffer.resize(chunk.size as usize, 0);
+        if file.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
             break;
         }
-
-        md5_ctx.consume(&buffer[..n]);
+        if file.read_exact(&mut buffer).await.is_err() {
+            break;
+        }
+        let digest = md5::compute(&buffer);
+        let actual = format!("{:x}", digest);
+        if actual != chunk.md5 {
+            break;
+        }
+        offset += chunk.size;
+        verified_chunks += 1;
     }
 
-    let md5 = md5_ctx.finalize();
-
-    Ok(md5)
+    Ok((verified_chunks, offset))
 }
 
-async fn hash_file_sha256(file: &mut tokio::fs::File) -> Result<[u8; 32], std::io::Error> {
-    let mut sha256_ctx = Sha256::new();
-
-    let buf_size = match file.metadata().await?.len() {
-        s if s < 256 * 1024 => 64 * 1024,       // tiny files
-        s if s < 8 * 1024 * 1024 => 256 * 1024, // small
-        _ => 2 * 1024 * 1024,                   // large
-    };
-
-    let mut buffer = vec![0u8; buf_size];
-
-    loop {
-        let n = file.read(&mut buffer).await?;
-        if n == 0 {
-            break;
-        }
-
-        sha256_ctx.update(&buffer[..n]);
+/// Feeds the first `up_to` bytes of `file` into `md5_ctx`/`sha256_ctx`, so a
+/// resumed download's whole-file hash check covers bytes that were already
+/// on disk (and verified by `verify_existing_chunks`) rather than just the
+/// bytes downloaded in this resumed session.
+async fn prime_hash_contexts(
+    file: &mut tokio::fs::File,
+    up_to: u64,
+    md5_ctx: &mut md5::Context,
+    sha256_ctx: &mut Sha256,
+) -> Result<(), ClientError> {
+    file.seek(std::io::SeekFrom::Start(0)).await?;
+    let mut remaining = up_to;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    while remaining > 0 {
+        let to_read = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..to_read]).await?;
+        md5_ctx.consume(&buffer[..to_read]);
+        sha256_ctx.update(&buffer[..to_read]);
+        remaining -= to_read as u64;
     }
-
-    let sha256: [u8; 32] = sha256_ctx.finalize().into();
-
-    Ok(sha256)
+    Ok(())
 }
 
 fn handle_file_downloads(
@@ -730,49 +742,21 @@ fn handle_file_downloads(
             Ok(permit) => permit,
             Err(err) => return Err(ClientError::SemaphoreError(err)),
         };
-        if let Ok(mut existing_file) = tokio::fs::File::open(path).await {
-            let mut file_valid = true;
+        let (verified_chunks, verified_len) = verify_existing_chunks(path, &chunks).await?;
+        // Progress is tracked in compressed (network-transfer) bytes elsewhere in this
+        // pipeline (see fetch_chunk's callback and download_game's total_size), while
+        // verified_len above is decompressed (on-disk) bytes used for seeking/truncating.
+        let verified_compressed_len: u64 = chunks[..verified_chunks]
+            .iter()
+            .map(|chunk| chunk.compressed_size)
+            .sum();
 
-            match (&file.md5, &file.sha256) {
-                (None, None) => {}
-                (None, Some(file_sha256)) => {
-                    let sha256 = hash_file_sha256(&mut existing_file).await?;
-                    let sha256_hex = hex::encode(sha256);
-
-                    if sha256_hex != *file_sha256 {
-                        file_valid = false;
-                    }
-                }
-                (Some(file_md5), None) => {
-                    let md5 = hash_file_md5(&mut existing_file).await?;
-                    let md5_hex = format!("{:x}", md5);
-
-                    if md5_hex != *file_md5 {
-                        file_valid = false;
-                    }
-                }
-                (Some(file_md5), Some(_sha256)) => {
-                    let md5 = hash_file_md5(&mut existing_file).await?;
-                    let md5_hex = format!("{:x}", md5);
-
-                    if md5_hex != *file_md5 {
-                        file_valid = false;
-                    }
-                }
-            }
-
-            if !file_valid {
-                drop(existing_file);
-                tokio::fs::remove_file(path).await?;
-            } else {
-                if let Some(chunks) = &file.chunks {
-                    let size: u64 = chunks.iter().map(|chunk| chunk.compressed_size).sum();
-                    let total_now =
-                        downloaded_total.fetch_add(size as i64, Ordering::Relaxed) + size as i64;
-                    let _ = tx_clone.send((total_now, total_size));
-                }
-                return Ok(());
-            }
+        if !chunks.is_empty() && verified_chunks == chunks.len() {
+            let total_now = downloaded_total
+                .fetch_add(verified_compressed_len as i64, Ordering::Relaxed)
+                + verified_compressed_len as i64;
+            let _ = tx_clone.send((total_now, total_size));
+            return Ok(());
         }
 
         if cancellation_token.is_cancelled() {
@@ -786,8 +770,32 @@ fn handle_file_downloads(
             Ok(permit) => permit,
             Err(err) => return Err(ClientError::SemaphoreError(err)),
         };
-        let mut tokio_file = tokio::fs::File::create(path).await?;
-        for chunk in chunks {
+        let mut tokio_file = if verified_chunks > 0 {
+            let mut existing_file = tokio::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .await?;
+            prime_hash_contexts(
+                &mut existing_file,
+                verified_len,
+                &mut md5_ctx,
+                &mut sha256_ctx,
+            )
+            .await?;
+            existing_file.set_len(verified_len).await?;
+            existing_file
+                .seek(std::io::SeekFrom::Start(verified_len))
+                .await?;
+            let total_now = downloaded_total
+                .fetch_add(verified_compressed_len as i64, Ordering::Relaxed)
+                + verified_compressed_len as i64;
+            let _ = tx_clone.send((total_now, total_size));
+            existing_file
+        } else {
+            tokio::fs::File::create(path).await?
+        };
+        for chunk in chunks.into_iter().skip(verified_chunks) {
             const MAX_RETRIES: usize = 3;
             let mut retries: usize = 0;
             loop {
@@ -941,6 +949,82 @@ pub async fn download_game(
     Ok(())
 }
 
+/// Bytes already on disk vs. still needed for a build, in compressed
+/// (network-transfer) bytes — matching the units `download_build`'s progress
+/// channel already reports. `remaining` is what a consumer can use to derive
+/// an ETA from its own measured throughput; this crate doesn't track
+/// bandwidth itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DownloadEstimate {
+    pub total_size: i64,
+    pub already_present: i64,
+    pub remaining: i64,
+}
+
+/// Computes how much of a build is already present and valid on disk at
+/// `path`, without downloading or writing anything. Stateless: re-derives
+/// the answer from the manifest and on-disk chunk hashes every call, using
+/// the same `verify_existing_chunks` check `download_build` itself uses to
+/// decide what to resume — so the estimate always matches what an actual
+/// (resumed) download would skip.
+pub async fn estimate_download(
+    auth: &Auth,
+    client: &reqwest::Client,
+    game_id: i32,
+    os: OperatingSystem,
+    version_name: &str,
+    path: &str,
+    game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
+    game_ids_cache: Arc<Mutex<Option<Vec<i32>>>>,
+) -> Result<DownloadEstimate, ClientError> {
+    let game_files = get_build_files(
+        auth,
+        client,
+        game_id,
+        os,
+        version_name,
+        game_details_cache.clone(),
+        game_ids_cache.clone(),
+    )
+    .await?;
+
+    let game_details = get_game_details(auth, client, game_id, game_details_cache.clone()).await?;
+
+    let mut estimate = DownloadEstimate::default();
+
+    for file in game_files {
+        let Some(chunks) = file.chunks else {
+            continue;
+        };
+
+        let file_total: i64 = chunks
+            .iter()
+            .map(|chunk| chunk.compressed_size as i64)
+            .sum();
+        estimate.total_size += file_total;
+
+        let file_path = format!(
+            "{}/{}/{}",
+            path,
+            game_details.title,
+            file.path
+                .replace("\\\\", "//")
+                .replace("\\ ", " ")
+                .replace("\\", "/")
+        );
+        let (verified_chunks, _) = verify_existing_chunks(Path::new(&file_path), &chunks).await?;
+        let file_present: i64 = chunks[..verified_chunks]
+            .iter()
+            .map(|chunk| chunk.compressed_size as i64)
+            .sum();
+        estimate.already_present += file_present;
+    }
+
+    estimate.remaining = estimate.total_size - estimate.already_present;
+
+    Ok(estimate)
+}
+
 impl UrlFormat {
     pub fn parse_url_redist(&self, chunk_hash: &str) -> String {
         let url = format!(
@@ -1062,5 +1146,48 @@ mod tests {
         let options = DownloadOptions::default();
         assert_eq!(options.max_concurrent_files, 36);
         assert_eq!(options.max_concurrent_hashing, 12);
+    }
+
+    #[tokio::test]
+    async fn verify_existing_chunks_stops_at_first_mismatch() {
+        let make_chunk = |data: &[u8]| Chunk {
+            md5: format!("{:x}", md5::compute(data)),
+            size: data.len() as u64,
+            compressed_md5: String::new(),
+            compressed_size: data.len() as u64,
+        };
+        let chunks = vec![
+            make_chunk(b"AAAA"),
+            make_chunk(b"BBBB"),
+            make_chunk(b"CCCC"),
+        ];
+
+        let path = std::env::temp_dir().join("gogdl_lib_test_verify_existing_chunks.bin");
+        // First two chunks match (AAAA, BBBB); the third's bytes (XXXX) don't match CCCC's hash.
+        tokio::fs::write(&path, b"AAAABBBBXXXX").await.unwrap();
+
+        let result = verify_existing_chunks(&path, &chunks).await;
+
+        tokio::fs::remove_file(&path).await.unwrap();
+
+        let (verified_chunks, verified_len) = result.unwrap();
+        assert_eq!(verified_chunks, 2);
+        assert_eq!(verified_len, 8);
+    }
+
+    #[tokio::test]
+    async fn verify_existing_chunks_returns_zero_for_missing_file() {
+        let chunks = vec![Chunk {
+            md5: format!("{:x}", md5::compute(b"AAAA")),
+            size: 4,
+            compressed_md5: String::new(),
+            compressed_size: 4,
+        }];
+        let path = std::env::temp_dir().join("gogdl_lib_test_verify_existing_chunks_missing.bin");
+
+        let (verified_chunks, verified_len) = verify_existing_chunks(&path, &chunks).await.unwrap();
+
+        assert_eq!(verified_chunks, 0);
+        assert_eq!(verified_len, 0);
     }
 }
