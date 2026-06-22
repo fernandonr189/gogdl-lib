@@ -2,11 +2,15 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc::UnboundedSender};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     auth::{Auth, get_login_tokens, refresh_token},
     client::ClientError,
-    games::{BuildMetadata, Chunk, DepotFile, GameBuilds, GameDetails, SecureLinks},
+    games::{
+        BuildMetadata, Chunk, DepotFile, DownloadOptions, GameBuilds, GameDetails, OperatingSystem,
+        SecureLinks,
+    },
     saves::{RemoteConfig, SaveFile},
 };
 
@@ -108,7 +112,37 @@ impl GogDl {
         }
     }
 
-    pub async fn get_game_builds(&self, game_id: i32) -> Result<GameBuilds, GogdlError> {
+    /// Clears the cached list of owned game IDs. The next call to
+    /// `get_owned_games` or `get_build_files`/`get_build_chunks` (which lazily
+    /// populate this cache) will re-fetch from the network.
+    pub async fn invalidate_owned_games_cache(&self) {
+        let mut cache_lock = self.game_ids_cache.lock().await;
+        *cache_lock = None;
+    }
+
+    /// Clears cached game details. If `game_id` is `Some`, only that entry is
+    /// removed; if `None`, the entire cache is cleared.
+    pub async fn invalidate_game_details_cache(&self, game_id: Option<i32>) {
+        let mut cache_lock = self.game_details_cache.lock().await;
+        match game_id {
+            Some(id) => {
+                cache_lock.remove(&id);
+            }
+            None => cache_lock.clear(),
+        }
+    }
+
+    /// Clears the owned-games cache and immediately re-fetches it.
+    pub async fn refresh_owned_games(&self) -> Result<Vec<GameDetails>, GogdlError> {
+        self.invalidate_owned_games_cache().await;
+        self.get_owned_games().await
+    }
+
+    pub async fn get_game_builds(
+        &self,
+        game_id: i32,
+        os: OperatingSystem,
+    ) -> Result<GameBuilds, GogdlError> {
         let auth = {
             let auth_lock = self.auth.lock().await;
             auth_lock.clone()
@@ -118,6 +152,7 @@ impl GogDl {
                 auth,
                 &self.client,
                 game_id,
+                os,
                 self.game_details_cache.clone(),
             )
             .await?;
@@ -129,6 +164,7 @@ impl GogDl {
     pub async fn get_build_metadata(
         &self,
         game_id: i32,
+        os: OperatingSystem,
         version_name: &str,
     ) -> Result<BuildMetadata, GogdlError> {
         let auth = {
@@ -140,6 +176,7 @@ impl GogDl {
                 auth,
                 &self.client,
                 game_id,
+                os,
                 version_name,
                 self.game_details_cache.clone(),
             )
@@ -152,6 +189,7 @@ impl GogDl {
     pub async fn get_build_files(
         &self,
         game_id: i32,
+        os: OperatingSystem,
         version_name: &str,
     ) -> Result<Vec<DepotFile>, GogdlError> {
         let auth = {
@@ -163,6 +201,7 @@ impl GogDl {
                 auth,
                 &self.client,
                 game_id,
+                os,
                 &version_name,
                 self.game_details_cache.clone(),
                 self.game_ids_cache.clone(),
@@ -179,6 +218,9 @@ impl GogDl {
         version_name: &str,
         tx: UnboundedSender<i64>,
         path: &str,
+        os: OperatingSystem,
+        cancellation_token: CancellationToken,
+        options: DownloadOptions,
     ) -> Result<(), GogdlError> {
         let auth = {
             let auth_lock = self.auth.lock().await;
@@ -189,11 +231,14 @@ impl GogDl {
                 auth,
                 &self.client,
                 game_id,
+                os,
                 &version_name,
                 tx,
                 path,
                 self.game_details_cache.clone(),
                 self.game_ids_cache.clone(),
+                cancellation_token,
+                options,
             )
             .await?;
             Ok(res)
@@ -204,6 +249,7 @@ impl GogDl {
     pub async fn get_build_chunks(
         &self,
         game_id: i32,
+        os: OperatingSystem,
         version_name: &str,
     ) -> Result<Vec<Chunk>, GogdlError> {
         let auth = {
@@ -215,6 +261,7 @@ impl GogDl {
                 auth,
                 &self.client,
                 game_id,
+                os,
                 &version_name,
                 self.game_details_cache.clone(),
                 self.game_ids_cache.clone(),
@@ -313,6 +360,28 @@ impl GogDl {
                 .get_cloud_saves_tokens(&self.client, client_id, client_secret)
                 .await?;
             saves::download_file(save_file, &saves_auth, &self.client, tx, path).await?;
+            Ok(())
+        } else {
+            Err(GogdlError::NotLoggedIn)
+        }
+    }
+    /// Deletes a cloud save file. See `saves::delete_save_file` — this
+    /// endpoint's behavior is unverified against GOG's live API.
+    pub async fn delete_save_file(
+        &self,
+        save_file: &SaveFile,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<(), GogdlError> {
+        let auth = {
+            let auth_lock = self.auth.lock().await;
+            auth_lock.clone()
+        };
+        if let Some(auth) = auth.as_ref() {
+            let saves_auth = auth
+                .get_cloud_saves_tokens(&self.client, client_id, client_secret)
+                .await?;
+            saves::delete_save_file(save_file, &saves_auth, &self.client).await?;
             Ok(())
         } else {
             Err(GogdlError::NotLoggedIn)

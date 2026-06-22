@@ -21,7 +21,7 @@ use tokio::{
 use crate::{
     auth::{Auth, SavesAuth},
     client::{ClientError, fetch_json, fetch_plain, fetch_save_file, upload_save_file},
-    games::{BuildMetadata, GameBuild, GameDetails, get_game_builds},
+    games::{BuildMetadata, GameBuild, GameDetails, OperatingSystem, get_game_builds},
 };
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -146,7 +146,17 @@ pub async fn get_auth_ids(
     auth: &Auth,
     game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
 ) -> Result<(String, String), ClientError> {
-    let game_builds = get_game_builds(auth, client, game_id, game_details_cache.clone()).await?;
+    // Cloud-save client_id/client_secret are tied to the product's Galaxy
+    // client registration, not the OS build — Windows is used as a stable
+    // default since GOG's save/remote-config model is itself Windows-centric.
+    let game_builds = get_game_builds(
+        auth,
+        client,
+        game_id,
+        OperatingSystem::Windows,
+        game_details_cache.clone(),
+    )
+    .await?;
     let game_build_link = first_build_link(&game_builds.items)?;
 
     let auth_ids = fetch_json::<BuildMetadata, String>(
@@ -226,6 +236,35 @@ pub async fn download_file(
         set_file_times(path, file_time, file_time)?;
     }
 
+    Ok(())
+}
+
+/// Deletes a save file from GOG's cloud storage.
+///
+/// **Unverified**: DELETE support on `cloudstorage.gog.com` is not documented
+/// anywhere in this crate's Notion Skills page and has no test environment to
+/// confirm against. This is the natural REST extrapolation of the documented
+/// list/upload/download endpoints (same URL shape as `download_file`), but
+/// callers should treat a successful `Ok(())` cautiously until confirmed
+/// against a real account.
+pub async fn delete_save_file(
+    save_file: &SaveFile,
+    auth: &SavesAuth,
+    client: &Client,
+) -> Result<(), ClientError> {
+    let url = format!(
+        "https://cloudstorage.gog.com/v1/{}/{}/{}",
+        auth.user_id, auth.client_id, save_file.0
+    );
+    fetch_plain::<String>(
+        &url,
+        Some(auth),
+        client,
+        crate::client::Method::Delete,
+        false,
+        None,
+    )
+    .await?;
     Ok(())
 }
 

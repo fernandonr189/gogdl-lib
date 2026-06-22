@@ -6,6 +6,7 @@ use reqwest::{
 };
 use serde::de::DeserializeOwned;
 use std::io::prelude::*;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::{sync::AcquireError, task::JoinError};
 
@@ -68,6 +69,9 @@ pub enum ClientError {
 
     #[error("Malformed save-file listing line: {0:?}")]
     MalformedSaveLine(String),
+
+    #[error("Download was cancelled")]
+    Cancelled,
 }
 
 fn header_to_str(value: &reqwest::header::HeaderValue) -> Result<&str, ClientError> {
@@ -93,6 +97,73 @@ fn check_content_length(actual: usize, expected: usize) -> Result<(), ClientErro
 pub enum Method {
     Post,
     Get,
+    Delete,
+}
+
+const FETCH_MAX_RETRIES: usize = 3;
+const FETCH_RETRY_BASE_DELAY_MS: u64 = 200;
+
+/// Decide whether a completed HTTP response status is worth retrying.
+fn is_retryable_status(status: StatusCode) -> bool {
+    status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS
+}
+
+/// Parse a `Retry-After` header value expressed in seconds. Returns `None`
+/// if the value isn't a plain number (the HTTP-date form isn't needed for
+/// GOG's API, so it's not supported here).
+fn parse_retry_after(value: &reqwest::header::HeaderValue) -> Option<Duration> {
+    header_to_str(value)
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+/// Sends a request built fresh on each attempt, retrying on transport errors,
+/// 5xx, and 429 (honoring `Retry-After` if present). Only covers the
+/// connect+send+headers phase — callers read/stream the body themselves, so
+/// a stream error mid-flight is never retried here.
+async fn send_with_retry<F>(build_request: F) -> Result<reqwest::Response, ClientError>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    let mut attempt = 0;
+    loop {
+        match build_request().send().await {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() || !is_retryable_status(status) {
+                    return Ok(response);
+                }
+                attempt += 1;
+                if attempt >= FETCH_MAX_RETRIES {
+                    return Ok(response);
+                }
+                let delay = if status == StatusCode::TOO_MANY_REQUESTS {
+                    response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(parse_retry_after)
+                        .unwrap_or(Duration::from_millis(
+                            FETCH_RETRY_BASE_DELAY_MS * attempt as u64,
+                        ))
+                } else {
+                    Duration::from_millis(FETCH_RETRY_BASE_DELAY_MS * attempt as u64)
+                };
+                tokio::time::sleep(delay).await;
+            }
+            Err(err) => {
+                attempt += 1;
+                if attempt >= FETCH_MAX_RETRIES {
+                    return Err(ClientError::Network(err));
+                }
+                tokio::time::sleep(Duration::from_millis(
+                    FETCH_RETRY_BASE_DELAY_MS * attempt as u64,
+                ))
+                .await;
+            }
+        }
+    }
 }
 
 pub async fn upload_save_file<T>(
@@ -175,13 +246,14 @@ where
     F: Fn(i64, i64),
 {
     let url = Url::parse(url)?;
-    let mut request = client.get(url);
-
-    if let Some(auth) = auth {
-        request = request.bearer_auth(&auth.access_token);
-    }
-
-    let response = request.send().await?;
+    let response = send_with_retry(|| {
+        let mut r = client.get(url.clone());
+        if let Some(auth) = auth {
+            r = r.bearer_auth(&auth.access_token);
+        }
+        r
+    })
+    .await?;
     let headers = response.headers().clone();
     let content_length = headers.get("content-length");
     let last_modified = headers.get("x-object-meta-locallastmodified");
@@ -239,13 +311,14 @@ where
     F: Fn(i64),
 {
     let url = Url::parse(url)?;
-    let mut request = client.get(url);
-
-    if let Some(auth) = auth {
-        request = request.bearer_auth(&auth.access_token);
-    }
-
-    let response = request.send().await?;
+    let response = send_with_retry(|| {
+        let mut r = client.get(url.clone());
+        if let Some(auth) = auth {
+            r = r.bearer_auth(&auth.access_token);
+        }
+        r
+    })
+    .await?;
     let status = response.status();
 
     if !status.is_success() {
@@ -287,22 +360,35 @@ where
     T: Into<Body>,
 {
     let url = Url::parse(url)?;
-    let mut request = match method {
-        Method::Get => client.get(url),
+    let response = match method {
+        Method::Get => {
+            send_with_retry(|| {
+                let mut r = client.get(url.clone());
+                if let Some(auth) = auth {
+                    r = r.bearer_auth(&auth.access_token);
+                }
+                r
+            })
+            .await?
+        }
         Method::Post => {
             let mut r = client.post(url);
             if let Some(body) = body {
                 r = r.body(body);
             }
-            r
+            if let Some(auth) = auth {
+                r = r.bearer_auth(&auth.access_token);
+            }
+            r.send().await?
+        }
+        Method::Delete => {
+            let mut r = client.delete(url);
+            if let Some(auth) = auth {
+                r = r.bearer_auth(&auth.access_token);
+            }
+            r.send().await?
         }
     };
-
-    if let Some(auth) = auth {
-        request = request.bearer_auth(&auth.access_token);
-    }
-
-    let response = request.send().await?;
     let status = response.status();
 
     if !status.is_success() {
@@ -338,22 +424,35 @@ where
     P: Into<Body>,
 {
     let url = Url::parse(url)?;
-    let mut request = match method {
-        Method::Get => client.get(url),
+    let response = match method {
+        Method::Get => {
+            send_with_retry(|| {
+                let mut r = client.get(url.clone());
+                if let Some(auth) = auth {
+                    r = r.bearer_auth(&auth.access_token);
+                }
+                r
+            })
+            .await?
+        }
         Method::Post => {
             let mut r = client.post(url);
             if let Some(body) = body {
                 r = r.body(body);
             }
-            r
+            if let Some(auth) = auth {
+                r = r.bearer_auth(&auth.access_token);
+            }
+            r.send().await?
+        }
+        Method::Delete => {
+            let mut r = client.delete(url);
+            if let Some(auth) = auth {
+                r = r.bearer_auth(&auth.access_token);
+            }
+            r.send().await?
         }
     };
-
-    if let Some(auth) = auth {
-        request = request.bearer_auth(&auth.access_token);
-    }
-
-    let response = request.send().await?;
     let status = response.status();
 
     if !status.is_success() {
@@ -433,5 +532,41 @@ mod tests {
                 actual: 50
             }
         ));
+    }
+
+    #[test]
+    fn is_retryable_status_true_for_5xx() {
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn is_retryable_status_true_for_429() {
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    #[test]
+    fn is_retryable_status_false_for_4xx_other_than_429() {
+        assert!(!is_retryable_status(StatusCode::NOT_FOUND));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn is_retryable_status_false_for_2xx() {
+        assert!(!is_retryable_status(StatusCode::OK));
+    }
+
+    #[test]
+    fn parse_retry_after_accepts_seconds() {
+        let value = HeaderValue::from_static("120");
+        assert_eq!(parse_retry_after(&value), Some(Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_non_numeric() {
+        let value = HeaderValue::from_static("not-a-number");
+        assert_eq!(parse_retry_after(&value), None);
     }
 }

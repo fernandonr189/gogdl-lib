@@ -26,6 +26,45 @@ use tokio::{
     sync::{Mutex, RwLock, Semaphore, mpsc::UnboundedSender},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatingSystem {
+    Windows,
+    Linux,
+    Mac,
+}
+
+impl OperatingSystem {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OperatingSystem::Windows => "windows",
+            OperatingSystem::Linux => "linux",
+            OperatingSystem::Mac => "osx",
+        }
+    }
+}
+
+impl std::fmt::Display for OperatingSystem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadOptions {
+    pub max_concurrent_files: usize,
+    pub max_concurrent_hashing: usize,
+}
+
+impl Default for DownloadOptions {
+    fn default() -> Self {
+        DownloadOptions {
+            max_concurrent_files: 36,
+            max_concurrent_hashing: 12,
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct GameIds {
@@ -291,11 +330,13 @@ pub async fn get_game_builds(
     auth: &Auth,
     client: &reqwest::Client,
     game_id: i32,
+    os: OperatingSystem,
     game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
 ) -> Result<GameBuilds, ClientError> {
     let url = format!(
-        "https://content-system.gog.com/products/{}/os/windows/builds?generation=2",
-        game_id
+        "https://content-system.gog.com/products/{}/os/{}/builds?generation=2",
+        game_id,
+        os.as_str()
     );
     let mut game_builds =
         fetch_json::<GameBuilds, String>(&url, Some(auth), client, Method::Get, false, None)
@@ -311,10 +352,12 @@ pub async fn get_build_metadata(
     auth: &Auth,
     client: &reqwest::Client,
     game_id: i32,
+    os: OperatingSystem,
     version_name: &str,
     game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
 ) -> Result<BuildMetadata, ClientError> {
-    let game_builds = get_game_builds(auth, client, game_id, game_details_cache.clone()).await?;
+    let game_builds =
+        get_game_builds(auth, client, game_id, os, game_details_cache.clone()).await?;
 
     let game_link = game_builds
         .items
@@ -369,6 +412,7 @@ pub async fn get_build_files(
     auth: &Auth,
     client: &reqwest::Client,
     game_id: i32,
+    os: OperatingSystem,
     version_name: &str,
     game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
     game_ids_cache: Arc<Mutex<Option<Vec<i32>>>>,
@@ -394,6 +438,7 @@ pub async fn get_build_files(
         auth,
         client,
         game_id,
+        os,
         version_name,
         game_details_cache.clone(),
     )
@@ -435,6 +480,7 @@ pub async fn get_build_chunks(
     auth: &Auth,
     client: &reqwest::Client,
     game_id: i32,
+    os: OperatingSystem,
     version_name: &str,
     game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
     game_ids_cache: Arc<Mutex<Option<Vec<i32>>>>,
@@ -443,6 +489,7 @@ pub async fn get_build_chunks(
         auth,
         client,
         game_id,
+        os,
         version_name,
         game_details_cache.clone(),
     )
@@ -639,6 +686,7 @@ fn handle_file_downloads(
     file: DepotFile,
     path: &str,
     game_name: &str,
+    cancellation_token: CancellationToken,
 ) -> JoinHandle<Result<(), ClientError>> {
     let client = client.clone();
     let tx_clone = tx.clone();
@@ -660,6 +708,10 @@ fn handle_file_downloads(
 
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
+        }
+
+        if cancellation_token.is_cancelled() {
+            return Err(ClientError::Cancelled);
         }
 
         let _permit = match hashing_semaphore.clone().acquire_owned().await {
@@ -709,6 +761,10 @@ fn handle_file_downloads(
             }
         }
 
+        if cancellation_token.is_cancelled() {
+            return Err(ClientError::Cancelled);
+        }
+
         let mut md5_ctx = md5::Context::new();
         let mut sha256_ctx = Sha256::new();
 
@@ -722,15 +778,20 @@ fn handle_file_downloads(
             let mut retries: usize = 0;
             loop {
                 let product_id = file.product_id.as_deref().unwrap_or("unknown");
-                match handle_chunk_download(
-                    &chunk,
-                    &secure_links_manager,
-                    product_id,
-                    &client,
-                    &tx_clone,
-                )
-                .await
-                {
+                let result = tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        let _ = tokio::fs::remove_file(path).await;
+                        return Err(ClientError::Cancelled);
+                    }
+                    result = handle_chunk_download(
+                        &chunk,
+                        &secure_links_manager,
+                        product_id,
+                        &client,
+                        &tx_clone,
+                    ) => result,
+                };
+                match result {
                     Ok(data) => {
                         md5_ctx.consume(&data);
                         sha256_ctx.update(&data);
@@ -782,26 +843,34 @@ pub async fn download_game(
     auth: &Auth,
     client: &reqwest::Client,
     game_id: i32,
+    os: OperatingSystem,
     build_name: &str,
     tx: UnboundedSender<i64>,
     path: &str,
     game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
     game_ids_cache: Arc<Mutex<Option<Vec<i32>>>>,
+    cancellation_token: CancellationToken,
+    options: DownloadOptions,
 ) -> Result<(), ClientError> {
     let game_files = get_build_files(
         auth,
         client,
         game_id,
+        os,
         build_name,
         game_details_cache.clone(),
         game_ids_cache.clone(),
     )
     .await?;
 
+    if cancellation_token.is_cancelled() {
+        return Err(ClientError::Cancelled);
+    }
+
     let game_details = get_game_details(auth, client, game_id, game_details_cache.clone()).await?;
 
-    let semaphore = Arc::new(Semaphore::new(36));
-    let hashing_semaphore = Arc::new(Semaphore::new(12));
+    let semaphore = Arc::new(Semaphore::new(options.max_concurrent_files));
+    let hashing_semaphore = Arc::new(Semaphore::new(options.max_concurrent_hashing));
 
     let mut handles: Vec<JoinHandle<Result<(), ClientError>>> = Vec::new();
 
@@ -821,6 +890,7 @@ pub async fn download_game(
                 file_clone,
                 path,
                 &game_details.title,
+                cancellation_token.clone(),
             );
             handles.push(handle);
         }
@@ -836,6 +906,10 @@ pub async fn download_game(
                 return Err(ClientError::AsyncError(join_err));
             }
         }
+    }
+
+    if cancellation_token.is_cancelled() {
+        return Err(ClientError::Cancelled);
     }
 
     Ok(())
@@ -941,5 +1015,26 @@ mod tests {
         let urls = vec![make_url_format(1), make_url_format(5), make_url_format(3)];
         let selected = select_max_priority_url(&urls).unwrap();
         assert_eq!(selected.priority, 5);
+    }
+
+    #[test]
+    fn operating_system_as_str_maps_known_values() {
+        assert_eq!(OperatingSystem::Windows.as_str(), "windows");
+        assert_eq!(OperatingSystem::Linux.as_str(), "linux");
+        assert_eq!(OperatingSystem::Mac.as_str(), "osx");
+    }
+
+    #[test]
+    fn operating_system_display_matches_as_str() {
+        assert_eq!(OperatingSystem::Windows.to_string(), "windows");
+        assert_eq!(OperatingSystem::Linux.to_string(), "linux");
+        assert_eq!(OperatingSystem::Mac.to_string(), "osx");
+    }
+
+    #[test]
+    fn download_options_default_matches_prior_hardcoded_values() {
+        let options = DownloadOptions::default();
+        assert_eq!(options.max_concurrent_files, 36);
+        assert_eq!(options.max_concurrent_hashing, 12);
     }
 }
