@@ -837,8 +837,10 @@ async fn finish_file_download(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_file_downloads(
     chunks: Vec<Chunk>,
+    known_state: Option<VerifiedFileState>,
     semaphore: Arc<Semaphore>,
     hashing_semaphore: Arc<Semaphore>,
     secure_links_manager: Arc<SecureLinksManager>,
@@ -868,15 +870,23 @@ fn handle_file_downloads(
             return Err(ClientError::Cancelled);
         }
 
-        // NOTE: this permit is intentionally held until the end of this task (not
-        // dropped after verification) — see `verify_and_repair_build`'s per-file task
-        // for the path that releases it early to allow full max_concurrent_files
-        // parallelism during the download phase.
-        let _permit = match hashing_semaphore.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(err) => return Err(ClientError::SemaphoreError(err)),
+        // If the caller already verified this file (e.g. via `estimate_download`)
+        // reuse that result instead of re-hashing it from disk. Otherwise fall
+        // back to verifying now — this permit is intentionally held until the
+        // end of this task in that case (not dropped after verification), see
+        // `verify_and_repair_build`'s per-file task for the path that releases
+        // it early to allow full max_concurrent_files parallelism during the
+        // download phase.
+        let (verified_chunks, verified_len) = match known_state {
+            Some(state) => (state.verified_chunks, state.verified_len),
+            None => {
+                let _permit = match hashing_semaphore.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(err) => return Err(ClientError::SemaphoreError(err)),
+                };
+                verify_existing_chunks(path, &chunks).await?
+            }
         };
-        let (verified_chunks, verified_len) = verify_existing_chunks(path, &chunks).await?;
         // Progress is tracked in compressed (network-transfer) bytes elsewhere in this
         // pipeline (see fetch_chunk's callback and download_game's total_size), while
         // verified_len above is decompressed (on-disk) bytes used for seeking/truncating.
@@ -913,6 +923,7 @@ fn handle_file_downloads(
     handle
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn download_game(
     auth: &Auth,
     client: &reqwest::Client,
@@ -925,6 +936,7 @@ pub async fn download_game(
     game_ids_cache: Arc<Mutex<Option<Vec<i32>>>>,
     cancellation_token: CancellationToken,
     options: DownloadOptions,
+    verified_files: HashMap<String, VerifiedFileState>,
 ) -> Result<(), ClientError> {
     let game_files = get_build_files(
         auth,
@@ -962,8 +974,10 @@ pub async fn download_game(
     for file in game_files {
         let file_clone = file.clone();
         if let Some(chunks) = file.chunks {
+            let known_state = verified_files.get(&file.path).copied();
             let handle = handle_file_downloads(
                 chunks,
+                known_state,
                 semaphore.clone(),
                 hashing_semaphore.clone(),
                 secure_links_manager.clone(),
@@ -1211,24 +1225,40 @@ pub async fn verify_and_repair_build(
     })
 }
 
+/// A file's on-disk verification result, as returned by
+/// `verify_existing_chunks` — kept around so a later `download_build` call
+/// can skip re-verifying (re-hashing) a file an earlier `estimate_download`
+/// call already checked.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VerifiedFileState {
+    pub verified_chunks: usize,
+    pub verified_len: u64,
+}
+
 /// Bytes already on disk vs. still needed for a build, in compressed
 /// (network-transfer) bytes — matching the units `download_build`'s progress
 /// channel already reports. `remaining` is what a consumer can use to derive
 /// an ETA from its own measured throughput; this crate doesn't track
-/// bandwidth itself.
-#[derive(Debug, Clone, Copy, Default)]
+/// bandwidth itself. `verified_files` carries forward the per-file
+/// verification result (keyed by the depot-relative `DepotFile::path`) so a
+/// following `download_build` call can reuse it instead of re-hashing.
+#[derive(Debug, Clone, Default)]
 pub struct DownloadEstimate {
     pub total_size: i64,
     pub already_present: i64,
     pub remaining: i64,
+    pub verified_files: HashMap<String, VerifiedFileState>,
 }
 
 /// Computes how much of a build is already present and valid on disk at
-/// `path`, without downloading or writing anything. Stateless: re-derives
-/// the answer from the manifest and on-disk chunk hashes every call, using
-/// the same `verify_existing_chunks` check `download_build` itself uses to
-/// decide what to resume — so the estimate always matches what an actual
-/// (resumed) download would skip.
+/// `path`, without downloading or writing anything. Re-derives the answer
+/// from the manifest and on-disk chunk hashes every call, using the same
+/// `verify_existing_chunks` check `download_build` itself uses to decide what
+/// to resume — so the estimate always matches what an actual (resumed)
+/// download would skip. Reports live progress on `tx` as `(verified_so_far,
+/// total_size)`, the same item shape `download_build`'s progress channel
+/// uses — a caller can share one channel/receiver across both calls to get a
+/// single continuous 0..total_size bar with no extra glue.
 pub async fn estimate_download(
     auth: &Auth,
     client: &reqwest::Client,
@@ -1238,6 +1268,7 @@ pub async fn estimate_download(
     path: &str,
     game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
     game_ids_cache: Arc<Mutex<Option<Vec<i32>>>>,
+    tx: UnboundedSender<(i64, i64)>,
 ) -> Result<DownloadEstimate, ClientError> {
     let game_files = get_build_files(
         auth,
@@ -1252,39 +1283,49 @@ pub async fn estimate_download(
 
     let game_details = get_game_details(auth, client, game_id, game_details_cache.clone()).await?;
 
-    let mut estimate = DownloadEstimate::default();
+    let total_size: i64 = game_files
+        .iter()
+        .filter_map(|f| f.chunks.as_ref())
+        .flat_map(|chunks| chunks.iter())
+        .map(|chunk| chunk.compressed_size as i64)
+        .sum();
+
+    let _ = tx.send((0, total_size));
+
+    let mut already_present: i64 = 0;
+    let mut verified_files = HashMap::new();
 
     for file in game_files {
-        let Some(chunks) = file.chunks else {
+        let Some(chunks) = file.chunks.as_ref() else {
             continue;
         };
 
-        let file_total: i64 = chunks
-            .iter()
-            .map(|chunk| chunk.compressed_size as i64)
-            .sum();
-        estimate.total_size += file_total;
-
-        let file_path = format!(
-            "{}/{}/{}",
-            path,
-            game_details.title,
-            file.path
-                .replace("\\\\", "//")
-                .replace("\\ ", " ")
-                .replace("\\", "/")
-        );
-        let (verified_chunks, _) = verify_existing_chunks(Path::new(&file_path), &chunks).await?;
+        let file_path = resolve_file_path(path, &game_details.title, &file);
+        let (verified_chunks, verified_len) =
+            verify_existing_chunks(Path::new(&file_path), chunks).await?;
         let file_present: i64 = chunks[..verified_chunks]
             .iter()
             .map(|chunk| chunk.compressed_size as i64)
             .sum();
-        estimate.already_present += file_present;
+        already_present += file_present;
+
+        verified_files.insert(
+            file.path.clone(),
+            VerifiedFileState {
+                verified_chunks,
+                verified_len,
+            },
+        );
+
+        let _ = tx.send((already_present, total_size));
     }
 
-    estimate.remaining = estimate.total_size - estimate.already_present;
-
-    Ok(estimate)
+    Ok(DownloadEstimate {
+        total_size,
+        already_present,
+        remaining: total_size - already_present,
+        verified_files,
+    })
 }
 
 impl UrlFormat {

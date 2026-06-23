@@ -10,6 +10,7 @@ use crate::{
     games::{
         BuildMetadata, Chunk, DepotFile, DownloadEstimate, DownloadOptions, GameBuilds,
         GameDetails, OperatingSystem, RepairProgress, RepairSummary, SecureLinks,
+        VerifiedFileState,
     },
     saves::{RemoteConfig, SaveFile},
 };
@@ -222,6 +223,7 @@ impl GogDl {
         os: OperatingSystem,
         cancellation_token: CancellationToken,
         options: DownloadOptions,
+        verified_files: HashMap<String, VerifiedFileState>,
     ) -> Result<(), GogdlError> {
         let auth = {
             let auth_lock = self.auth.lock().await;
@@ -240,6 +242,7 @@ impl GogDl {
                 self.game_ids_cache.clone(),
                 cancellation_token,
                 options,
+                verified_files,
             )
             .await?;
             Ok(res)
@@ -293,6 +296,7 @@ impl GogDl {
         os: OperatingSystem,
         version_name: &str,
         path: &str,
+        tx: UnboundedSender<(i64, i64)>,
     ) -> Result<DownloadEstimate, GogdlError> {
         let auth = {
             let auth_lock = self.auth.lock().await;
@@ -308,6 +312,7 @@ impl GogDl {
                 path,
                 self.game_details_cache.clone(),
                 self.game_ids_cache.clone(),
+                tx,
             )
             .await?;
             Ok(estimate)
