@@ -8,8 +8,8 @@ use crate::{
     auth::{Auth, get_login_tokens, refresh_token},
     client::ClientError,
     games::{
-        BuildMetadata, Chunk, DepotFile, DownloadEstimate, DownloadOptions, GameBuilds,
-        GameDetails, OperatingSystem, RepairProgress, RepairSummary, SecureLinks,
+        BuildMetadata, Chunk, CleanupSummary, DepotFile, DownloadEstimate, DownloadOptions,
+        GameBuilds, GameDetails, OperatingSystem, RepairProgress, RepairSummary, SecureLinks,
         VerifiedFileState,
     },
     saves::{RemoteConfig, SaveFile},
@@ -283,6 +283,41 @@ impl GogDl {
                 self.game_ids_cache.clone(),
                 cancellation_token,
                 options,
+            )
+            .await?;
+            Ok(summary)
+        } else {
+            Err(GogdlError::NotLoggedIn)
+        }
+    }
+    /// Deletes on-disk files (and directories left empty as a result) under
+    /// the resolved game directory for `build_name` that aren't referenced
+    /// by that build's manifest. See `games::cleanup_build` for the full
+    /// contract — in particular, it's a no-op if the game directory doesn't
+    /// exist yet, rather than an error.
+    pub async fn cleanup_build(
+        &self,
+        game_id: i32,
+        build_name: &str,
+        path: &str,
+        os: OperatingSystem,
+        cancellation_token: CancellationToken,
+    ) -> Result<CleanupSummary, GogdlError> {
+        let auth = {
+            let auth_lock = self.auth.lock().await;
+            auth_lock.clone()
+        };
+        if let Some(auth) = auth.as_ref() {
+            let summary = games::cleanup_build(
+                auth,
+                &self.client,
+                game_id,
+                os,
+                build_name,
+                path,
+                self.game_details_cache.clone(),
+                self.game_ids_cache.clone(),
+                cancellation_token,
             )
             .await?;
             Ok(summary)

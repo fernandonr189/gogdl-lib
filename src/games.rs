@@ -1,6 +1,6 @@
 use std::{
-    collections::HashMap,
-    path::Path,
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicI64, Ordering},
@@ -701,11 +701,14 @@ async fn prime_hash_contexts(
     Ok(())
 }
 
+fn game_root_path(path: &str, game_name: &str) -> String {
+    format!("{}/{}", path, game_name)
+}
+
 fn resolve_file_path(path: &str, game_name: &str, file: &DepotFile) -> String {
     format!(
-        "{}/{}/{}",
-        path,
-        game_name,
+        "{}/{}",
+        game_root_path(path, game_name),
         file.path
             .replace("\\\\", "//")
             .replace("\\ ", " ")
@@ -1328,6 +1331,116 @@ pub async fn estimate_download(
     })
 }
 
+/// Outcome of `cleanup_build`: what was removed from disk because it wasn't
+/// referenced by the current build's manifest.
+#[derive(Debug, Clone, Default)]
+pub struct CleanupSummary {
+    pub removed_files: Vec<String>,
+    pub removed_dirs: Vec<String>,
+    pub removed_bytes: i64,
+}
+
+/// Walks `root` and deletes any file not present in `expected`, then prunes
+/// directories left empty by those deletions (deepest first, so a parent
+/// emptied by removing its last child directory is pruned in the same pass).
+/// Pure disk I/O, no network/auth — kept separate from `cleanup_build` so it
+/// can be exercised directly in tests.
+async fn cleanup_directory(
+    root: &Path,
+    expected: &HashSet<PathBuf>,
+    cancellation_token: &CancellationToken,
+) -> Result<CleanupSummary, ClientError> {
+    let mut summary = CleanupSummary::default();
+
+    if tokio::fs::metadata(root).await.is_err() {
+        return Ok(summary);
+    }
+
+    // Depth is tracked alongside each pending directory so the prune pass
+    // below can sort deepest-first without re-walking the tree.
+    let mut pending_dirs = vec![(root.to_path_buf(), 0usize)];
+    let mut visited_dirs: Vec<(PathBuf, usize)> = Vec::new();
+
+    while let Some((dir, depth)) = pending_dirs.pop() {
+        if cancellation_token.is_cancelled() {
+            return Err(ClientError::Cancelled);
+        }
+
+        let mut entries = tokio::fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let entry_path = entry.path();
+            let file_type = entry.file_type().await?;
+
+            if file_type.is_dir() {
+                visited_dirs.push((entry_path.clone(), depth + 1));
+                pending_dirs.push((entry_path, depth + 1));
+                continue;
+            }
+
+            if !expected.contains(&entry_path) {
+                let size = entry.metadata().await?.len();
+                tokio::fs::remove_file(&entry_path).await?;
+                summary.removed_bytes += size as i64;
+                summary
+                    .removed_files
+                    .push(entry_path.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    visited_dirs.sort_by_key(|(_, depth)| std::cmp::Reverse(*depth));
+    for (dir, _) in visited_dirs {
+        let mut entries = tokio::fs::read_dir(&dir).await?;
+        if entries.next_entry().await?.is_none() {
+            tokio::fs::remove_dir(&dir).await?;
+            summary
+                .removed_dirs
+                .push(dir.to_string_lossy().into_owned());
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Deletes on-disk files (and directories left empty as a result) under the
+/// resolved game directory for `build_name` that aren't referenced by that
+/// build's manifest — clearing residual files left behind by an upgrade,
+/// repair, or version switch. A no-op (not an error) if the game directory
+/// doesn't exist yet.
+#[allow(clippy::too_many_arguments)]
+pub async fn cleanup_build(
+    auth: &Auth,
+    client: &reqwest::Client,
+    game_id: i32,
+    os: OperatingSystem,
+    build_name: &str,
+    path: &str,
+    game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
+    game_ids_cache: Arc<Mutex<Option<Vec<i32>>>>,
+    cancellation_token: CancellationToken,
+) -> Result<CleanupSummary, ClientError> {
+    let game_files = get_build_files(
+        auth,
+        client,
+        game_id,
+        os,
+        build_name,
+        game_details_cache.clone(),
+        game_ids_cache.clone(),
+    )
+    .await?;
+
+    let game_details = get_game_details(auth, client, game_id, game_details_cache.clone()).await?;
+
+    let expected: HashSet<PathBuf> = game_files
+        .iter()
+        .map(|file| PathBuf::from(resolve_file_path(path, &game_details.title, file)))
+        .collect();
+
+    let root = PathBuf::from(game_root_path(path, &game_details.title));
+    cleanup_directory(&root, &expected, &cancellation_token).await
+}
+
 impl UrlFormat {
     pub fn parse_url_redist(&self, chunk_hash: &str) -> String {
         let url = format!(
@@ -1492,5 +1605,62 @@ mod tests {
 
         assert_eq!(verified_chunks, 0);
         assert_eq!(verified_len, 0);
+    }
+
+    async fn write_test_file(path: &Path, contents: &[u8]) {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        tokio::fs::write(path, contents).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_directory_removes_unexpected_files_and_prunes_empty_dirs() {
+        let root =
+            std::env::temp_dir().join(format!("gogdl_lib_test_cleanup_{}", uuid::Uuid::new_v4()));
+
+        let keep = root.join("keep.txt");
+        let stale = root.join("stale.txt");
+        let nested_stale = root.join("old_subdir").join("leftover.bin");
+
+        write_test_file(&keep, b"keep me").await;
+        write_test_file(&stale, b"delete me").await;
+        write_test_file(&nested_stale, b"delete me too").await;
+
+        let expected: HashSet<PathBuf> = HashSet::from([keep.clone()]);
+
+        let summary = cleanup_directory(&root, &expected, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(keep.exists());
+        assert!(!stale.exists());
+        assert!(!nested_stale.exists());
+        assert!(!root.join("old_subdir").exists());
+
+        assert_eq!(
+            summary.removed_bytes,
+            "delete me".len() as i64 + "delete me too".len() as i64
+        );
+        assert_eq!(summary.removed_files.len(), 2);
+        assert_eq!(summary.removed_dirs.len(), 1);
+
+        tokio::fs::remove_dir_all(&root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_directory_is_noop_for_missing_root() {
+        let root = std::env::temp_dir().join(format!(
+            "gogdl_lib_test_cleanup_missing_{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let summary = cleanup_directory(&root, &HashSet::new(), &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(summary.removed_files.len(), 0);
+        assert_eq!(summary.removed_dirs.len(), 0);
+        assert_eq!(summary.removed_bytes, 0);
     }
 }
