@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -58,6 +58,13 @@ impl std::fmt::Display for OperatingSystem {
 pub struct DownloadOptions {
     pub max_concurrent_files: usize,
     pub max_concurrent_hashing: usize,
+    /// Caps how many chunk fetches may be in flight at once *across the whole
+    /// download*, independent of how many files are still incomplete. Without
+    /// this, intra-file chunk fetches are sequential, so once fewer than
+    /// `max_concurrent_files` files remain (e.g. one large file at the tail
+    /// of a download), effective network concurrency collapses to the number
+    /// of remaining files.
+    pub max_concurrent_chunks: usize,
 }
 
 impl Default for DownloadOptions {
@@ -65,6 +72,7 @@ impl Default for DownloadOptions {
         DownloadOptions {
             max_concurrent_files: 36,
             max_concurrent_hashing: 12,
+            max_concurrent_chunks: 36,
         }
     }
 }
@@ -566,14 +574,102 @@ fn select_max_priority_url(urls: &[UrlFormat]) -> Result<&UrlFormat, ClientError
         .ok_or(ClientError::NotFound)
 }
 
+/// Bundles the shared `downloaded_total` counter with the channel it reports
+/// through, plus a lock that serializes each (update, send) pair so receivers
+/// never observe a smaller total after a larger one — without this, two
+/// chunk fetches racing on "bump the counter, then send" can have their two
+/// steps interleave across tasks and deliver totals out of order. The lock
+/// only ever guards two cheap in-memory ops (no I/O), so it's a `std::sync`
+/// blocking mutex rather than an async one — cheaper than a tokio mutex and
+/// usable from the non-async progress callbacks passed to `fetch_chunk`.
+#[derive(Clone)]
+struct ProgressReporter {
+    total: Arc<AtomicI64>,
+    tx: UnboundedSender<(i64, i64)>,
+    order_lock: Arc<std::sync::Mutex<()>>,
+}
+
+impl ProgressReporter {
+    fn new(total: Arc<AtomicI64>, tx: UnboundedSender<(i64, i64)>) -> Self {
+        ProgressReporter {
+            total,
+            tx,
+            order_lock: Arc::new(std::sync::Mutex::new(())),
+        }
+    }
+
+    fn add(&self, amount: i64, total_size: i64) {
+        if amount == 0 {
+            return;
+        }
+        let _guard = self.order_lock.lock().unwrap();
+        let total_now = self.total.fetch_add(amount, Ordering::Relaxed) + amount;
+        let _ = self.tx.send((total_now, total_size));
+    }
+
+    /// Undoes progress already credited (a chunk attempt that ultimately
+    /// failed, or a file abandoned after some of its chunks succeeded) by
+    /// subtracting `amount` from the shared cumulative counter and reporting
+    /// the corrected total.
+    fn rollback(&self, amount: i64, total_size: i64) {
+        if amount == 0 {
+            return;
+        }
+        let _guard = self.order_lock.lock().unwrap();
+        let total_now = self.total.fetch_sub(amount, Ordering::Relaxed) - amount;
+        let _ = self.tx.send((total_now, total_size));
+    }
+}
+
+/// Couples the cross-file chunk-concurrency semaphore with the configured
+/// maximum that sized it — `Semaphore` has no way to ask "what was your
+/// capacity", but `finish_file_download` needs that number too, to bound how
+/// many of one file's chunk futures it buffers at once. Clamps to at least 1
+/// so `DownloadOptions { max_concurrent_chunks: 0, .. }` can't silently
+/// deadlock every download on a zero-permit semaphore.
+#[derive(Clone)]
+struct ChunkBudget {
+    semaphore: Arc<Semaphore>,
+    max: usize,
+}
+
+impl ChunkBudget {
+    fn new(max_concurrent_chunks: usize) -> Self {
+        let max = max_concurrent_chunks.max(1);
+        ChunkBudget {
+            semaphore: Arc::new(Semaphore::new(max)),
+            max,
+        }
+    }
+
+    fn window(&self, remaining: usize) -> usize {
+        remaining.min(self.max).max(1)
+    }
+}
+
+/// Rolls back the progress credited for a file's already-succeeded chunks and
+/// deletes the partial file. Called from every failure path in
+/// `finish_file_download` once at least one chunk may have been credited —
+/// without it, bytes credited for chunks that never end up surviving on disk
+/// stay permanently counted in the shared progress total.
+async fn abandon_file(
+    path: &Path,
+    progress: &ProgressReporter,
+    file_credited: i64,
+    total_size: i64,
+) {
+    progress.rollback(file_credited, total_size);
+    let _ = tokio::fs::remove_file(path).await;
+}
+
 async fn handle_chunk_download(
     chunk: &Chunk,
     secure_links_manager: &Arc<SecureLinksManager>,
     product_id: &str,
     client: &reqwest::Client,
-    tx: &UnboundedSender<(i64, i64)>,
-    downloaded_total: &Arc<AtomicI64>,
+    progress: &ProgressReporter,
     total_size: i64,
+    chunk_budget: &ChunkBudget,
 ) -> Result<Vec<u8>, ClientError> {
     // Get fresh links for this product (will refresh if expired)
     let secure_links = secure_links_manager
@@ -585,36 +681,32 @@ async fn handle_chunk_download(
     let url = url_format.parse_url(&chunk.compressed_md5);
     let alternate_url = url_format.parse_url_redist(&chunk.compressed_md5);
 
+    // Bounds how many chunk fetches are in flight across the whole download
+    // (not just this file) — acquired only once a request is actually about
+    // to be issued (not while waiting on the secure-link fetch/refresh
+    // above), held across the primary + fallback attempt for this one chunk,
+    // released when this function returns.
+    let _chunk_permit = match chunk_budget.semaphore.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(err) => return Err(ClientError::SemaphoreError(err)),
+    };
+
     let downloaded_bytes = Arc::new(AtomicI64::new(0));
     let bytes_clone = downloaded_bytes.clone();
     let res = match fetch_chunk(&url, None, &client, |f| {
         bytes_clone.fetch_add(f, Ordering::Relaxed);
-        let total_now = downloaded_total.fetch_add(f, Ordering::Relaxed) + f;
-        let _ = tx.send((total_now, total_size));
+        progress.add(f, total_size);
     })
     .await
     {
         Ok(chunk) => Ok(chunk),
         Err(_primary_err) => {
-            let downloaded = bytes_clone.swap(0, Ordering::Relaxed);
-            let total_now = downloaded_total.fetch_sub(downloaded, Ordering::Relaxed) - downloaded;
-            let _ = tx.send((total_now, total_size));
-            match fetch_chunk(&alternate_url, None, &client, |f| {
+            progress.rollback(bytes_clone.swap(0, Ordering::Relaxed), total_size);
+            fetch_chunk(&alternate_url, None, &client, |f| {
                 bytes_clone.fetch_add(f, Ordering::Relaxed);
-                let total_now = downloaded_total.fetch_add(f, Ordering::Relaxed) + f;
-                let _ = tx.send((total_now, total_size));
+                progress.add(f, total_size);
             })
             .await
-            {
-                Ok(chunk) => Ok(chunk),
-                Err(err) => {
-                    let downloaded = bytes_clone.swap(0, Ordering::Relaxed);
-                    let total_now =
-                        downloaded_total.fetch_sub(downloaded, Ordering::Relaxed) - downloaded;
-                    let _ = tx.send((total_now, total_size));
-                    Err(err)
-                }
-            }
         }
     };
 
@@ -623,19 +715,65 @@ async fn handle_chunk_download(
             let digest = md5::compute(&downloaded_chunk);
             let actual = format!("{:x}", digest);
             if actual != chunk.md5 {
-                let downloaded = bytes_clone.swap(0, Ordering::Relaxed);
-                let total_now =
-                    downloaded_total.fetch_sub(downloaded, Ordering::Relaxed) - downloaded;
-                let _ = tx.send((total_now, total_size));
-                return Err(ClientError::HashMismatch {
+                progress.rollback(bytes_clone.swap(0, Ordering::Relaxed), total_size);
+                Err(ClientError::HashMismatch {
                     expected: chunk.md5.clone(),
                     actual,
-                });
+                })
             } else {
                 Ok(downloaded_chunk)
             }
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            progress.rollback(bytes_clone.swap(0, Ordering::Relaxed), total_size);
+            Err(err)
+        }
+    }
+}
+
+/// Retries `handle_chunk_download` up to `MAX_RETRIES` times with linear
+/// backoff (`200ms * attempt`). Pulled out of `finish_file_download`'s old
+/// sequential chunk loop so each chunk's fetch-and-retry can run as its own
+/// future inside a `buffered` stream (see `finish_file_download`), instead of
+/// being awaited one at a time.
+///
+/// This isn't a duplicate of `client::send_with_retry` (used internally by
+/// `fetch_chunk`): that layer retries transport failures/5xx/429 *before* a
+/// response is fully read, while this loop retries the whole chunk pipeline
+/// — primary-then-fallback URL and the post-download hash check — as a unit,
+/// which `send_with_retry` has no visibility into.
+async fn fetch_chunk_with_retry(
+    chunk: Chunk,
+    product_id: Arc<str>,
+    secure_links_manager: Arc<SecureLinksManager>,
+    client: Client,
+    progress: ProgressReporter,
+    total_size: i64,
+    chunk_budget: ChunkBudget,
+) -> Result<Vec<u8>, ClientError> {
+    const MAX_RETRIES: usize = 3;
+    let mut retries: usize = 0;
+    loop {
+        match handle_chunk_download(
+            &chunk,
+            &secure_links_manager,
+            &product_id,
+            &client,
+            &progress,
+            total_size,
+            &chunk_budget,
+        )
+        .await
+        {
+            Ok(data) => return Ok(data),
+            Err(err) => {
+                retries += 1;
+                if retries >= MAX_RETRIES {
+                    return Err(err);
+                }
+                tokio::time::sleep(Duration::from_millis(200 * retries as u64)).await;
+            }
+        }
     }
 }
 
@@ -731,11 +869,11 @@ async fn finish_file_download(
     verified_len: u64,
     verified_compressed_len: u64,
     semaphore: Arc<Semaphore>,
+    chunk_budget: ChunkBudget,
     secure_links_manager: Arc<SecureLinksManager>,
     client: Client,
-    tx: UnboundedSender<(i64, i64)>,
+    progress: ProgressReporter,
     cancellation_token: CancellationToken,
-    downloaded_total: Arc<AtomicI64>,
     total_size: i64,
 ) -> Result<(), ClientError> {
     if cancellation_token.is_cancelled() {
@@ -766,60 +904,91 @@ async fn finish_file_download(
         existing_file
             .seek(std::io::SeekFrom::Start(verified_len))
             .await?;
-        let total_now = downloaded_total
-            .fetch_add(verified_compressed_len as i64, Ordering::Relaxed)
-            + verified_compressed_len as i64;
-        let _ = tx.send((total_now, total_size));
+        progress.add(verified_compressed_len as i64, total_size);
         existing_file
     } else {
         tokio::fs::File::create(path).await?
     };
-    for chunk in chunks.into_iter().skip(verified_chunks) {
-        const MAX_RETRIES: usize = 3;
-        let mut retries: usize = 0;
-        loop {
-            let product_id = file.product_id.as_deref().unwrap_or("unknown");
-            let result = tokio::select! {
-                _ = cancellation_token.cancelled() => {
-                    let _ = tokio::fs::remove_file(path).await;
-                    return Err(ClientError::Cancelled);
+    let product_id: Arc<str> = Arc::from(file.product_id.as_deref().unwrap_or("unknown"));
+    // A lightweight parallel list of each remaining chunk's compressed size,
+    // popped in lockstep with the (order-preserving) chunk stream below — so
+    // we don't need to collect the chunks themselves (each owning two
+    // `String`s) into a second `Vec` just to know their sizes.
+    let mut remaining_sizes: VecDeque<i64> = chunks[verified_chunks..]
+        .iter()
+        .map(|c| c.compressed_size as i64)
+        .collect();
+    let remaining_len = chunks.len() - verified_chunks;
+    // Bounds how many of *this file's* chunk futures are buffered at once;
+    // the actual cross-file network concurrency cap is `chunk_budget`'s
+    // semaphore, acquired inside each `handle_chunk_download` call. `buffered`
+    // (not `buffer_unordered`) preserves chunk order, which the sequential
+    // `write_all`/hash-context updates below depend on, while still polling
+    // up to `window` chunk fetches concurrently.
+    let window = chunk_budget.window(remaining_len);
+    let mut chunk_stream = stream::iter(chunks.into_iter().skip(verified_chunks).map(|chunk| {
+        fetch_chunk_with_retry(
+            chunk,
+            product_id.clone(),
+            secure_links_manager.clone(),
+            client.clone(),
+            progress.clone(),
+            total_size,
+            chunk_budget.clone(),
+        )
+    }))
+    .buffered(window);
+
+    // Bytes already credited to the shared progress counter for chunks of
+    // *this* file that have succeeded so far. `buffered` polls ahead of the
+    // chunk currently being consumed, so a later chunk can succeed (and get
+    // credited) before an earlier one permanently fails — if that happens,
+    // this file is abandoned and those already-credited bytes must be rolled
+    // back, since they never end up surviving on disk.
+    let mut file_credited: i64 = 0;
+
+    loop {
+        let next = tokio::select! {
+            _ = cancellation_token.cancelled() => {
+                abandon_file(path, &progress, file_credited, total_size).await;
+                return Err(ClientError::Cancelled);
+            }
+            next = chunk_stream.next() => next,
+        };
+        let Some(result) = next else {
+            break;
+        };
+        match result {
+            Ok(data) => {
+                file_credited += remaining_sizes.pop_front().unwrap_or(0);
+                md5_ctx.consume(&data);
+                sha256_ctx.update(&data);
+                if let Err(err) = tokio_file.write_all(&data).await {
+                    abandon_file(path, &progress, file_credited, total_size).await;
+                    return Err(err.into());
                 }
-                result = handle_chunk_download(
-                    &chunk,
-                    &secure_links_manager,
-                    product_id,
-                    &client,
-                    &tx,
-                    &downloaded_total,
-                    total_size,
-                ) => result,
-            };
-            match result {
-                Ok(data) => {
-                    md5_ctx.consume(&data);
-                    sha256_ctx.update(&data);
-                    tokio_file.write_all(&data).await?;
-                    break;
-                }
-                Err(err) => {
-                    retries += 1;
-                    tokio::time::sleep(Duration::from_millis(200 * retries as u64)).await;
-                    if retries >= MAX_RETRIES {
-                        let _ = tokio::fs::remove_file(path).await;
-                        return Err(err);
-                    }
-                }
+            }
+            Err(err) => {
+                abandon_file(path, &progress, file_credited, total_size).await;
+                return Err(err);
             }
         }
     }
-    tokio_file.flush().await?;
-    tokio_file.sync_all().await?;
+    if let Err(err) = tokio_file.flush().await {
+        abandon_file(path, &progress, file_credited, total_size).await;
+        return Err(err.into());
+    }
+    if let Err(err) = tokio_file.sync_all().await {
+        abandon_file(path, &progress, file_credited, total_size).await;
+        return Err(err.into());
+    }
     drop(tokio_file);
     // Verify hash
     if let Some(file_md5) = file.md5 {
         let digest = md5_ctx.finalize();
         let actual = format!("{:x}", digest);
         if actual != file_md5 {
+            abandon_file(path, &progress, file_credited, total_size).await;
             return Err(ClientError::HashMismatch {
                 expected: file_md5,
                 actual,
@@ -831,6 +1000,7 @@ async fn finish_file_download(
         let hash_bytes: [u8; 32] = sha_digest.into();
         let hash_hex = hex::encode(hash_bytes);
         if hash_hex != file_sha256 {
+            abandon_file(path, &progress, file_credited, total_size).await;
             return Err(ClientError::HashMismatch {
                 expected: file_sha256,
                 actual: hash_hex,
@@ -846,18 +1016,17 @@ fn handle_file_downloads(
     known_state: Option<VerifiedFileState>,
     semaphore: Arc<Semaphore>,
     hashing_semaphore: Arc<Semaphore>,
+    chunk_budget: ChunkBudget,
     secure_links_manager: Arc<SecureLinksManager>,
     client: &Client,
-    tx: &UnboundedSender<(i64, i64)>,
+    progress: ProgressReporter,
     file: DepotFile,
     path: &str,
     game_name: &str,
     cancellation_token: CancellationToken,
-    downloaded_total: Arc<AtomicI64>,
     total_size: i64,
 ) -> JoinHandle<Result<(), ClientError>> {
     let client = client.clone();
-    let tx_clone = tx.clone();
     let path_copy = path.to_string();
     let game_name_clone = game_name.to_string();
 
@@ -899,10 +1068,7 @@ fn handle_file_downloads(
             .sum();
 
         if !chunks.is_empty() && verified_chunks == chunks.len() {
-            let total_now = downloaded_total
-                .fetch_add(verified_compressed_len as i64, Ordering::Relaxed)
-                + verified_compressed_len as i64;
-            let _ = tx_clone.send((total_now, total_size));
+            progress.add(verified_compressed_len as i64, total_size);
             return Ok(());
         }
 
@@ -914,11 +1080,11 @@ fn handle_file_downloads(
             verified_len,
             verified_compressed_len,
             semaphore,
+            chunk_budget,
             secure_links_manager,
             client,
-            tx_clone,
+            progress,
             cancellation_token,
-            downloaded_total,
             total_size,
         )
         .await
@@ -926,21 +1092,31 @@ fn handle_file_downloads(
     handle
 }
 
+/// Output of `prepare_build_download` — named instead of a positional tuple
+/// so a future reordering of these fields can't silently compile-break a
+/// call site that destructures it.
+struct PreparedBuildDownload {
+    game_files: Vec<DepotFile>,
+    game_details: GameDetails,
+    total_size: i64,
+    secure_links_manager: Arc<SecureLinksManager>,
+}
+
+/// Fetches the manifest-driven file list, the game's display title, and the
+/// build's total compressed size, and constructs a fresh `SecureLinksManager`
+/// — the setup `download_game` and `verify_and_repair_build` both did
+/// verbatim before spawning any per-file work.
 #[allow(clippy::too_many_arguments)]
-pub async fn download_game(
+async fn prepare_build_download(
     auth: &Auth,
     client: &reqwest::Client,
     game_id: i32,
     os: OperatingSystem,
     build_name: &str,
-    tx: UnboundedSender<(i64, i64)>,
-    path: &str,
     game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
     game_ids_cache: Arc<Mutex<Option<Vec<i32>>>>,
-    cancellation_token: CancellationToken,
-    options: DownloadOptions,
-    verified_files: HashMap<String, VerifiedFileState>,
-) -> Result<(), ClientError> {
+    cancellation_token: &CancellationToken,
+) -> Result<PreparedBuildDownload, ClientError> {
     let game_files = get_build_files(
         auth,
         client,
@@ -964,17 +1140,54 @@ pub async fn download_game(
         .flat_map(|chunks| chunks.iter())
         .map(|chunk| chunk.compressed_size as i64)
         .sum();
-    let downloaded_total = Arc::new(AtomicI64::new(0));
 
-    let semaphore = Arc::new(Semaphore::new(options.max_concurrent_files));
-    let hashing_semaphore = Arc::new(Semaphore::new(options.max_concurrent_hashing));
+    let secure_links_manager = Arc::new(SecureLinksManager::new(auth.clone(), client.clone()));
+
+    Ok(PreparedBuildDownload {
+        game_files,
+        game_details,
+        total_size,
+        secure_links_manager,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn download_game(
+    auth: &Auth,
+    client: &reqwest::Client,
+    game_id: i32,
+    os: OperatingSystem,
+    build_name: &str,
+    tx: UnboundedSender<(i64, i64)>,
+    path: &str,
+    game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
+    game_ids_cache: Arc<Mutex<Option<Vec<i32>>>>,
+    cancellation_token: CancellationToken,
+    options: DownloadOptions,
+    verified_files: HashMap<String, VerifiedFileState>,
+) -> Result<(), ClientError> {
+    let prepared = prepare_build_download(
+        auth,
+        client,
+        game_id,
+        os,
+        build_name,
+        game_details_cache.clone(),
+        game_ids_cache.clone(),
+        &cancellation_token,
+    )
+    .await?;
+
+    let downloaded_total = Arc::new(AtomicI64::new(0));
+    let progress = ProgressReporter::new(downloaded_total, tx);
+
+    let semaphore = Arc::new(Semaphore::new(options.max_concurrent_files.max(1)));
+    let hashing_semaphore = Arc::new(Semaphore::new(options.max_concurrent_hashing.max(1)));
+    let chunk_budget = ChunkBudget::new(options.max_concurrent_chunks);
 
     let mut handles: Vec<JoinHandle<Result<(), ClientError>>> = Vec::new();
 
-    // Create a manager that will fetch and cache secure links per product_id
-    let secure_links_manager = Arc::new(SecureLinksManager::new(auth.clone(), client.clone()));
-
-    for file in game_files {
+    for file in prepared.game_files {
         let file_clone = file.clone();
         if let Some(chunks) = file.chunks {
             let known_state = verified_files.get(&file.path).copied();
@@ -983,15 +1196,15 @@ pub async fn download_game(
                 known_state,
                 semaphore.clone(),
                 hashing_semaphore.clone(),
-                secure_links_manager.clone(),
+                chunk_budget.clone(),
+                prepared.secure_links_manager.clone(),
                 client,
-                &tx,
+                progress.clone(),
                 file_clone,
                 path,
-                &game_details.title,
+                &prepared.game_details.title,
                 cancellation_token.clone(),
-                downloaded_total.clone(),
-                total_size,
+                prepared.total_size,
             );
             handles.push(handle);
         }
@@ -1067,7 +1280,7 @@ pub async fn verify_and_repair_build(
     cancellation_token: CancellationToken,
     options: DownloadOptions,
 ) -> Result<RepairSummary, ClientError> {
-    let game_files = get_build_files(
+    let prepared = prepare_build_download(
         auth,
         client,
         game_id,
@@ -1075,40 +1288,29 @@ pub async fn verify_and_repair_build(
         build_name,
         game_details_cache.clone(),
         game_ids_cache.clone(),
+        &cancellation_token,
     )
     .await?;
-
-    if cancellation_token.is_cancelled() {
-        return Err(ClientError::Cancelled);
-    }
-
-    let game_details = get_game_details(auth, client, game_id, game_details_cache.clone()).await?;
-
-    let total_size: i64 = game_files
-        .iter()
-        .filter_map(|f| f.chunks.as_ref())
-        .flat_map(|chunks| chunks.iter())
-        .map(|chunk| chunk.compressed_size as i64)
-        .sum();
 
     // Report the total up front, before any disk activity, so a caller can
     // print it immediately instead of waiting on the (potentially long)
     // verify pass below.
     let _ = tx.send(RepairProgress::Verifying {
         verified: 0,
-        total: total_size,
+        total: prepared.total_size,
     });
 
-    let semaphore = Arc::new(Semaphore::new(options.max_concurrent_files));
-    let hashing_semaphore = Arc::new(Semaphore::new(options.max_concurrent_hashing));
+    let semaphore = Arc::new(Semaphore::new(options.max_concurrent_files.max(1)));
+    let hashing_semaphore = Arc::new(Semaphore::new(options.max_concurrent_hashing.max(1)));
+    let chunk_budget = ChunkBudget::new(options.max_concurrent_chunks);
     let verified_total = Arc::new(AtomicI64::new(0));
     let downloaded_total = Arc::new(AtomicI64::new(0));
-    let secure_links_manager = Arc::new(SecureLinksManager::new(auth.clone(), client.clone()));
 
     // Download-phase progress flows over an internal (i64, i64) channel (the
     // same shape `handle_chunk_download`/`finish_file_download` already
     // speak) and gets forwarded onto the public `tx` as `Downloading`.
     let (inner_tx, mut inner_rx) = unbounded_channel::<(i64, i64)>();
+    let progress = ProgressReporter::new(downloaded_total, inner_tx);
     let forward_tx = tx.clone();
     let forwarder = tokio::spawn(async move {
         while let Some((downloaded, total)) = inner_rx.recv().await {
@@ -1118,7 +1320,7 @@ pub async fn verify_and_repair_build(
 
     let mut handles: Vec<JoinHandle<Result<Option<String>, ClientError>>> = Vec::new();
 
-    for file in game_files {
+    for file in prepared.game_files {
         let file_clone = file.clone();
         let Some(chunks) = file.chunks else {
             continue;
@@ -1126,14 +1328,15 @@ pub async fn verify_and_repair_build(
 
         let semaphore = semaphore.clone();
         let hashing_semaphore = hashing_semaphore.clone();
-        let secure_links_manager = secure_links_manager.clone();
+        let chunk_budget = chunk_budget.clone();
+        let secure_links_manager = prepared.secure_links_manager.clone();
         let client = client.clone();
-        let inner_tx = inner_tx.clone();
+        let progress = progress.clone();
         let tx = tx.clone();
         let cancellation_token = cancellation_token.clone();
-        let downloaded_total = downloaded_total.clone();
         let verified_total = verified_total.clone();
-        let file_path = resolve_file_path(path, &game_details.title, &file_clone);
+        let total_size = prepared.total_size;
+        let file_path = resolve_file_path(path, &prepared.game_details.title, &file_clone);
 
         let handle: JoinHandle<Result<Option<String>, ClientError>> = tokio::spawn(async move {
             let disk_path = Path::new(&file_path);
@@ -1186,11 +1389,11 @@ pub async fn verify_and_repair_build(
                 verified_len,
                 verified_compressed_len,
                 semaphore,
+                chunk_budget,
                 secure_links_manager,
                 client,
-                inner_tx,
+                progress,
                 cancellation_token,
-                downloaded_total,
                 total_size,
             )
             .await?;
@@ -1200,7 +1403,7 @@ pub async fn verify_and_repair_build(
         handles.push(handle);
     }
 
-    drop(inner_tx);
+    drop(progress);
 
     let mut repaired_files = Vec::new();
     for res in futures::future::join_all(handles).await {
@@ -1221,9 +1424,9 @@ pub async fn verify_and_repair_build(
     let already_valid = verified_total.load(Ordering::Relaxed);
 
     Ok(RepairSummary {
-        total_size,
+        total_size: prepared.total_size,
         already_valid,
-        repaired: total_size - already_valid,
+        repaired: prepared.total_size - already_valid,
         repaired_files,
     })
 }
@@ -1562,6 +1765,22 @@ mod tests {
         let options = DownloadOptions::default();
         assert_eq!(options.max_concurrent_files, 36);
         assert_eq!(options.max_concurrent_hashing, 12);
+        assert_eq!(options.max_concurrent_chunks, 36);
+    }
+
+    #[test]
+    fn chunk_budget_clamps_zero_to_one() {
+        let budget = ChunkBudget::new(0);
+        assert_eq!(budget.max, 1);
+        assert_eq!(budget.semaphore.available_permits(), 1);
+    }
+
+    #[test]
+    fn chunk_budget_window_bounded_by_max_and_remaining() {
+        let budget = ChunkBudget::new(4);
+        assert_eq!(budget.window(10), 4);
+        assert_eq!(budget.window(2), 2);
+        assert_eq!(budget.window(0), 1);
     }
 
     #[tokio::test]
