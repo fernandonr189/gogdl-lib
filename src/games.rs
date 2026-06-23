@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::{Mutex, RwLock, Semaphore, mpsc::UnboundedSender},
+    sync::{
+        Mutex, RwLock, Semaphore,
+        mpsc::{UnboundedSender, unbounded_channel},
+    },
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -698,6 +701,142 @@ async fn prime_hash_contexts(
     Ok(())
 }
 
+fn resolve_file_path(path: &str, game_name: &str, file: &DepotFile) -> String {
+    format!(
+        "{}/{}/{}",
+        path,
+        game_name,
+        file.path
+            .replace("\\\\", "//")
+            .replace("\\ ", " ")
+            .replace("\\", "/")
+    )
+}
+
+/// Downloads/writes the chunks of `chunks` starting after `verified_chunks`
+/// (the prefix already confirmed valid on disk by `verify_existing_chunks`),
+/// then verifies the resulting whole-file md5/sha256. Shared by
+/// `handle_file_downloads` (which re-verifies every call) and
+/// `verify_and_repair_build` (which verifies once up front and passes the
+/// result straight in, skipping a second disk pass).
+#[allow(clippy::too_many_arguments)]
+async fn finish_file_download(
+    path: &Path,
+    file: DepotFile,
+    chunks: Vec<Chunk>,
+    verified_chunks: usize,
+    verified_len: u64,
+    verified_compressed_len: u64,
+    semaphore: Arc<Semaphore>,
+    secure_links_manager: Arc<SecureLinksManager>,
+    client: Client,
+    tx: UnboundedSender<(i64, i64)>,
+    cancellation_token: CancellationToken,
+    downloaded_total: Arc<AtomicI64>,
+    total_size: i64,
+) -> Result<(), ClientError> {
+    if cancellation_token.is_cancelled() {
+        return Err(ClientError::Cancelled);
+    }
+
+    let mut md5_ctx = md5::Context::new();
+    let mut sha256_ctx = Sha256::new();
+
+    let _permit = match semaphore.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(err) => return Err(ClientError::SemaphoreError(err)),
+    };
+    let mut tokio_file = if verified_chunks > 0 {
+        let mut existing_file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .await?;
+        prime_hash_contexts(
+            &mut existing_file,
+            verified_len,
+            &mut md5_ctx,
+            &mut sha256_ctx,
+        )
+        .await?;
+        existing_file.set_len(verified_len).await?;
+        existing_file
+            .seek(std::io::SeekFrom::Start(verified_len))
+            .await?;
+        let total_now = downloaded_total
+            .fetch_add(verified_compressed_len as i64, Ordering::Relaxed)
+            + verified_compressed_len as i64;
+        let _ = tx.send((total_now, total_size));
+        existing_file
+    } else {
+        tokio::fs::File::create(path).await?
+    };
+    for chunk in chunks.into_iter().skip(verified_chunks) {
+        const MAX_RETRIES: usize = 3;
+        let mut retries: usize = 0;
+        loop {
+            let product_id = file.product_id.as_deref().unwrap_or("unknown");
+            let result = tokio::select! {
+                _ = cancellation_token.cancelled() => {
+                    let _ = tokio::fs::remove_file(path).await;
+                    return Err(ClientError::Cancelled);
+                }
+                result = handle_chunk_download(
+                    &chunk,
+                    &secure_links_manager,
+                    product_id,
+                    &client,
+                    &tx,
+                    &downloaded_total,
+                    total_size,
+                ) => result,
+            };
+            match result {
+                Ok(data) => {
+                    md5_ctx.consume(&data);
+                    sha256_ctx.update(&data);
+                    tokio_file.write_all(&data).await?;
+                    break;
+                }
+                Err(err) => {
+                    retries += 1;
+                    tokio::time::sleep(Duration::from_millis(200 * retries as u64)).await;
+                    if retries >= MAX_RETRIES {
+                        let _ = tokio::fs::remove_file(path).await;
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    }
+    tokio_file.flush().await?;
+    tokio_file.sync_all().await?;
+    drop(tokio_file);
+    // Verify hash
+    if let Some(file_md5) = file.md5 {
+        let digest = md5_ctx.finalize();
+        let actual = format!("{:x}", digest);
+        if actual != file_md5 {
+            return Err(ClientError::HashMismatch {
+                expected: file_md5,
+                actual,
+            });
+        }
+    }
+    if let Some(file_sha256) = file.sha256 {
+        let sha_digest = sha256_ctx.finalize();
+        let hash_bytes: [u8; 32] = sha_digest.into();
+        let hash_hex = hex::encode(hash_bytes);
+        if hash_hex != file_sha256 {
+            return Err(ClientError::HashMismatch {
+                expected: file_sha256,
+                actual: hash_hex,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn handle_file_downloads(
     chunks: Vec<Chunk>,
     semaphore: Arc<Semaphore>,
@@ -718,16 +857,7 @@ fn handle_file_downloads(
     let game_name_clone = game_name.to_string();
 
     let handle: JoinHandle<Result<(), ClientError>> = tokio::spawn(async move {
-        let file_path = format!(
-            "{}/{}/{}",
-            path_copy,
-            game_name_clone,
-            file.path
-                .replace("\\\\", "//")
-                .replace("\\ ", " ")
-                .replace("\\", "/")
-        );
-
+        let file_path = resolve_file_path(&path_copy, &game_name_clone, &file);
         let path = Path::new(&file_path);
 
         if let Some(parent) = path.parent() {
@@ -738,6 +868,10 @@ fn handle_file_downloads(
             return Err(ClientError::Cancelled);
         }
 
+        // NOTE: this permit is intentionally held until the end of this task (not
+        // dropped after verification) — see `verify_and_repair_build`'s per-file task
+        // for the path that releases it early to allow full max_concurrent_files
+        // parallelism during the download phase.
         let _permit = match hashing_semaphore.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(err) => return Err(ClientError::SemaphoreError(err)),
@@ -759,106 +893,22 @@ fn handle_file_downloads(
             return Ok(());
         }
 
-        if cancellation_token.is_cancelled() {
-            return Err(ClientError::Cancelled);
-        }
-
-        let mut md5_ctx = md5::Context::new();
-        let mut sha256_ctx = Sha256::new();
-
-        let _permit = match semaphore.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(err) => return Err(ClientError::SemaphoreError(err)),
-        };
-        let mut tokio_file = if verified_chunks > 0 {
-            let mut existing_file = tokio::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
-                .await?;
-            prime_hash_contexts(
-                &mut existing_file,
-                verified_len,
-                &mut md5_ctx,
-                &mut sha256_ctx,
-            )
-            .await?;
-            existing_file.set_len(verified_len).await?;
-            existing_file
-                .seek(std::io::SeekFrom::Start(verified_len))
-                .await?;
-            let total_now = downloaded_total
-                .fetch_add(verified_compressed_len as i64, Ordering::Relaxed)
-                + verified_compressed_len as i64;
-            let _ = tx_clone.send((total_now, total_size));
-            existing_file
-        } else {
-            tokio::fs::File::create(path).await?
-        };
-        for chunk in chunks.into_iter().skip(verified_chunks) {
-            const MAX_RETRIES: usize = 3;
-            let mut retries: usize = 0;
-            loop {
-                let product_id = file.product_id.as_deref().unwrap_or("unknown");
-                let result = tokio::select! {
-                    _ = cancellation_token.cancelled() => {
-                        let _ = tokio::fs::remove_file(path).await;
-                        return Err(ClientError::Cancelled);
-                    }
-                    result = handle_chunk_download(
-                        &chunk,
-                        &secure_links_manager,
-                        product_id,
-                        &client,
-                        &tx_clone,
-                        &downloaded_total,
-                        total_size,
-                    ) => result,
-                };
-                match result {
-                    Ok(data) => {
-                        md5_ctx.consume(&data);
-                        sha256_ctx.update(&data);
-                        tokio_file.write_all(&data).await?;
-                        break;
-                    }
-                    Err(err) => {
-                        retries += 1;
-                        tokio::time::sleep(Duration::from_millis(200 * retries as u64)).await;
-                        if retries >= MAX_RETRIES {
-                            let _ = tokio::fs::remove_file(path).await;
-                            return Err(err);
-                        }
-                    }
-                }
-            }
-        }
-        tokio_file.flush().await?;
-        tokio_file.sync_all().await?;
-        drop(tokio_file);
-        // Verify hash
-        if let Some(file_md5) = file.md5 {
-            let digest = md5_ctx.finalize();
-            let actual = format!("{:x}", digest);
-            if actual != file_md5 {
-                return Err(ClientError::HashMismatch {
-                    expected: file_md5,
-                    actual,
-                });
-            }
-        }
-        if let Some(file_sha256) = file.sha256 {
-            let sha_digest = sha256_ctx.finalize();
-            let hash_bytes: [u8; 32] = sha_digest.into();
-            let hash_hex = hex::encode(hash_bytes);
-            if hash_hex != file_sha256 {
-                return Err(ClientError::HashMismatch {
-                    expected: file_sha256,
-                    actual: hash_hex,
-                });
-            }
-        }
-        Ok(())
+        finish_file_download(
+            path,
+            file,
+            chunks,
+            verified_chunks,
+            verified_len,
+            verified_compressed_len,
+            semaphore,
+            secure_links_manager,
+            client,
+            tx_clone,
+            cancellation_token,
+            downloaded_total,
+            total_size,
+        )
+        .await
     });
     handle
 }
@@ -947,6 +997,218 @@ pub async fn download_game(
     }
 
     Ok(())
+}
+
+/// Live progress for `verify_and_repair_build`. `Verifying` accumulates in
+/// compressed-byte units (matching `total_size`) as each file's on-disk state
+/// is confirmed. `Downloading` reports bytes fetched *this session* only —
+/// unlike `download_build`'s progress channel, it does not include bytes that
+/// were already valid on disk (those are reflected once, via `Verifying` and
+/// `RepairSummary::already_valid`). A caller that wants a single continuous
+/// 0%-100% bar should add the latest `Verifying::verified` total (or
+/// `RepairSummary::already_valid`) to `Downloading::downloaded` itself.
+#[derive(Debug, Clone, Copy)]
+pub enum RepairProgress {
+    Verifying { verified: i64, total: i64 },
+    Downloading { downloaded: i64, total: i64 },
+}
+
+/// Outcome of `verify_and_repair_build`: how much of the build was already
+/// valid on disk vs. how much had to be (re)downloaded this session, plus
+/// which files needed repair. Only ever returned on success — a failed
+/// verify/repair returns `Err` instead, so `repaired` is always well-defined
+/// as `total_size - already_valid`.
+#[derive(Debug, Clone, Default)]
+pub struct RepairSummary {
+    pub total_size: i64,
+    pub already_valid: i64,
+    pub repaired: i64,
+    pub repaired_files: Vec<String>,
+}
+
+/// Single-pass verify-and-repair: fetches the build manifest once and
+/// verifies on-disk chunk validity once per file (reporting
+/// `RepairProgress::Verifying` throughout, instead of `estimate_download`'s
+/// silent pass), then downloads only the missing/corrupt chunks each file's
+/// verification found — using that in-memory result directly rather than
+/// re-verifying from disk a second time, unlike calling `estimate_download`
+/// followed by `download_build`. Verification and download are overlapped
+/// per file (each file's task verifies, then immediately downloads if
+/// needed) rather than run as two global passes, so files needing repair
+/// don't wait on slower files' verification elsewhere.
+#[allow(clippy::too_many_arguments)]
+pub async fn verify_and_repair_build(
+    auth: &Auth,
+    client: &reqwest::Client,
+    game_id: i32,
+    os: OperatingSystem,
+    build_name: &str,
+    tx: UnboundedSender<RepairProgress>,
+    path: &str,
+    game_details_cache: Arc<Mutex<HashMap<i32, GameDetails>>>,
+    game_ids_cache: Arc<Mutex<Option<Vec<i32>>>>,
+    cancellation_token: CancellationToken,
+    options: DownloadOptions,
+) -> Result<RepairSummary, ClientError> {
+    let game_files = get_build_files(
+        auth,
+        client,
+        game_id,
+        os,
+        build_name,
+        game_details_cache.clone(),
+        game_ids_cache.clone(),
+    )
+    .await?;
+
+    if cancellation_token.is_cancelled() {
+        return Err(ClientError::Cancelled);
+    }
+
+    let game_details = get_game_details(auth, client, game_id, game_details_cache.clone()).await?;
+
+    let total_size: i64 = game_files
+        .iter()
+        .filter_map(|f| f.chunks.as_ref())
+        .flat_map(|chunks| chunks.iter())
+        .map(|chunk| chunk.compressed_size as i64)
+        .sum();
+
+    // Report the total up front, before any disk activity, so a caller can
+    // print it immediately instead of waiting on the (potentially long)
+    // verify pass below.
+    let _ = tx.send(RepairProgress::Verifying {
+        verified: 0,
+        total: total_size,
+    });
+
+    let semaphore = Arc::new(Semaphore::new(options.max_concurrent_files));
+    let hashing_semaphore = Arc::new(Semaphore::new(options.max_concurrent_hashing));
+    let verified_total = Arc::new(AtomicI64::new(0));
+    let downloaded_total = Arc::new(AtomicI64::new(0));
+    let secure_links_manager = Arc::new(SecureLinksManager::new(auth.clone(), client.clone()));
+
+    // Download-phase progress flows over an internal (i64, i64) channel (the
+    // same shape `handle_chunk_download`/`finish_file_download` already
+    // speak) and gets forwarded onto the public `tx` as `Downloading`.
+    let (inner_tx, mut inner_rx) = unbounded_channel::<(i64, i64)>();
+    let forward_tx = tx.clone();
+    let forwarder = tokio::spawn(async move {
+        while let Some((downloaded, total)) = inner_rx.recv().await {
+            let _ = forward_tx.send(RepairProgress::Downloading { downloaded, total });
+        }
+    });
+
+    let mut handles: Vec<JoinHandle<Result<Option<String>, ClientError>>> = Vec::new();
+
+    for file in game_files {
+        let file_clone = file.clone();
+        let Some(chunks) = file.chunks else {
+            continue;
+        };
+
+        let semaphore = semaphore.clone();
+        let hashing_semaphore = hashing_semaphore.clone();
+        let secure_links_manager = secure_links_manager.clone();
+        let client = client.clone();
+        let inner_tx = inner_tx.clone();
+        let tx = tx.clone();
+        let cancellation_token = cancellation_token.clone();
+        let downloaded_total = downloaded_total.clone();
+        let verified_total = verified_total.clone();
+        let file_path = resolve_file_path(path, &game_details.title, &file_clone);
+
+        let handle: JoinHandle<Result<Option<String>, ClientError>> = tokio::spawn(async move {
+            let disk_path = Path::new(&file_path);
+
+            if cancellation_token.is_cancelled() {
+                return Err(ClientError::Cancelled);
+            }
+
+            if let Some(parent) = disk_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+
+            // Released as soon as verification finishes (unlike
+            // `handle_file_downloads`, which holds it through the download
+            // too) so this phase doesn't cap concurrency at
+            // `max_concurrent_hashing` once a file actually starts downloading.
+            let hashing_permit = match hashing_semaphore.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(err) => return Err(ClientError::SemaphoreError(err)),
+            };
+            let (verified_chunks, verified_len) =
+                verify_existing_chunks(disk_path, &chunks).await?;
+            drop(hashing_permit);
+
+            let verified_compressed_len: u64 = chunks[..verified_chunks]
+                .iter()
+                .map(|chunk| chunk.compressed_size)
+                .sum();
+            let verified_now = verified_total
+                .fetch_add(verified_compressed_len as i64, Ordering::Relaxed)
+                + verified_compressed_len as i64;
+            let _ = tx.send(RepairProgress::Verifying {
+                verified: verified_now,
+                total: total_size,
+            });
+
+            if !chunks.is_empty() && verified_chunks == chunks.len() {
+                return Ok(None);
+            }
+
+            if cancellation_token.is_cancelled() {
+                return Err(ClientError::Cancelled);
+            }
+
+            finish_file_download(
+                disk_path,
+                file_clone,
+                chunks,
+                verified_chunks,
+                verified_len,
+                verified_compressed_len,
+                semaphore,
+                secure_links_manager,
+                client,
+                inner_tx,
+                cancellation_token,
+                downloaded_total,
+                total_size,
+            )
+            .await?;
+
+            Ok(Some(file_path))
+        });
+        handles.push(handle);
+    }
+
+    drop(inner_tx);
+
+    let mut repaired_files = Vec::new();
+    for res in futures::future::join_all(handles).await {
+        match res {
+            Ok(Ok(Some(repaired_path))) => repaired_files.push(repaired_path),
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(join_err) => return Err(ClientError::AsyncError(join_err)),
+        }
+    }
+
+    let _ = forwarder.await;
+
+    if cancellation_token.is_cancelled() {
+        return Err(ClientError::Cancelled);
+    }
+
+    let already_valid = verified_total.load(Ordering::Relaxed);
+
+    Ok(RepairSummary {
+        total_size,
+        already_valid,
+        repaired: total_size - already_valid,
+        repaired_files,
+    })
 }
 
 /// Bytes already on disk vs. still needed for a build, in compressed

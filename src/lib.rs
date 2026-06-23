@@ -9,7 +9,7 @@ use crate::{
     client::ClientError,
     games::{
         BuildMetadata, Chunk, DepotFile, DownloadEstimate, DownloadOptions, GameBuilds,
-        GameDetails, OperatingSystem, SecureLinks,
+        GameDetails, OperatingSystem, RepairProgress, RepairSummary, SecureLinks,
     },
     saves::{RemoteConfig, SaveFile},
 };
@@ -245,6 +245,46 @@ impl GogDl {
             Ok(res)
         } else {
             return Err(GogdlError::NotLoggedIn);
+        }
+    }
+    /// Single-pass verify-and-repair: fetches the build manifest once,
+    /// verifies on-disk state once (reporting `RepairProgress::Verifying`
+    /// throughout), then downloads only what verification found
+    /// missing/corrupt. See `games::verify_and_repair_build` for the full
+    /// contract — in particular, `RepairProgress::Downloading` reports
+    /// session-only bytes, not cumulative-including-already-valid.
+    pub async fn verify_and_repair_build(
+        &self,
+        game_id: i32,
+        version_name: &str,
+        tx: UnboundedSender<RepairProgress>,
+        path: &str,
+        os: OperatingSystem,
+        cancellation_token: CancellationToken,
+        options: DownloadOptions,
+    ) -> Result<RepairSummary, GogdlError> {
+        let auth = {
+            let auth_lock = self.auth.lock().await;
+            auth_lock.clone()
+        };
+        if let Some(auth) = auth.as_ref() {
+            let summary = games::verify_and_repair_build(
+                auth,
+                &self.client,
+                game_id,
+                os,
+                version_name,
+                tx,
+                path,
+                self.game_details_cache.clone(),
+                self.game_ids_cache.clone(),
+                cancellation_token,
+                options,
+            )
+            .await?;
+            Ok(summary)
+        } else {
+            Err(GogdlError::NotLoggedIn)
         }
     }
     pub async fn estimate_download(
