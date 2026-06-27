@@ -1,5 +1,6 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
+use reqwest::StatusCode;
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
@@ -63,17 +64,19 @@ impl GogDl {
         }
     }
 
-    pub async fn get_login_tokens(&self, code: &str) -> Result<Auth, ClientError> {
-        let auth = get_login_tokens(code, &self.client).await?;
+    pub async fn get_login_tokens(&self, code: &str) -> Result<Auth, GogdlError> {
+        let auth = get_login_tokens(code, &self.client)
+            .await
+            .map_err(GogdlError::from)?;
         Ok(auth)
     }
 
-    pub async fn validate_auth(&self) -> Result<(), ClientError> {
+    pub async fn validate_auth(&self) -> Result<(), GogdlError> {
         let auth_lock = self.auth.lock().await;
         if let Some(auth) = auth_lock.as_ref() {
-            auth.validate_token().await
+            auth.validate_token().await.map_err(GogdlError::from)
         } else {
-            Err(ClientError::NotLoggedIn)
+            Err(GogdlError::NotLoggedIn)
         }
     }
 
@@ -89,7 +92,13 @@ impl GogDl {
                 game_id,
                 self.game_details_cache.clone(),
             )
-            .await?;
+            .await
+            .map_err(|e| match e {
+                ClientError::Http { status, .. } if status == StatusCode::NOT_FOUND => {
+                    GogdlError::GameNotFound { game_id }
+                }
+                e => GogdlError::from(e),
+            })?;
             Ok(game_details)
         } else {
             return Err(GogdlError::NotLoggedIn);
@@ -157,7 +166,13 @@ impl GogDl {
                 os,
                 self.game_details_cache.clone(),
             )
-            .await?;
+            .await
+            .map_err(|e| match e {
+                ClientError::Http { status, .. } if status == StatusCode::NOT_FOUND => {
+                    GogdlError::NoPlatformBuilds { game_id, os }
+                }
+                e => GogdlError::from(e),
+            })?;
             Ok(game_builds)
         } else {
             return Err(GogdlError::NotLoggedIn);
@@ -182,7 +197,14 @@ impl GogDl {
                 version_name,
                 self.game_details_cache.clone(),
             )
-            .await?;
+            .await
+            .map_err(|e| match e {
+                ClientError::BuildNotFound(_) => GogdlError::BuildVersionNotFound {
+                    game_id,
+                    version_name: version_name.to_string(),
+                },
+                e => GogdlError::from(e),
+            })?;
             Ok(build_metadata)
         } else {
             return Err(GogdlError::NotLoggedIn);
@@ -393,8 +415,10 @@ impl GogDl {
             return Err(GogdlError::NotLoggedIn);
         }
     }
-    pub async fn get_remote_config(&self, client_id: &str) -> Result<RemoteConfig, ClientError> {
-        let remote_config = saves::get_remote_config(&self.client, client_id).await?;
+    pub async fn get_remote_config(&self, client_id: &str) -> Result<RemoteConfig, GogdlError> {
+        let remote_config = saves::get_remote_config(&self.client, client_id)
+            .await
+            .map_err(GogdlError::from)?;
         Ok(remote_config)
     }
     pub async fn get_auth_ids(&self, game_id: i32) -> Result<(String, String), GogdlError> {
@@ -500,8 +524,130 @@ impl GogDl {
 
 #[derive(Error, Debug)]
 pub enum GogdlError {
-    #[error("Auth not available, please log in")]
+    // Auth
+    #[error("Not logged in")]
     NotLoggedIn,
-    #[error("Error: {0}")]
-    ClientError(#[from] ClientError),
+    #[error("Access token expired — call refresh_token()")]
+    TokenExpired,
+
+    // Game catalog
+    #[error("No builds available for game {game_id} on {os}")]
+    NoPlatformBuilds { game_id: i32, os: OperatingSystem },
+    #[error("Build version {version_name:?} not found for game {game_id}")]
+    BuildVersionNotFound { game_id: i32, version_name: String },
+    #[error("Game {game_id} not found")]
+    GameNotFound { game_id: i32 },
+
+    // Download integrity
+    #[error("Hash mismatch: expected {expected}, got {actual}")]
+    HashMismatch { expected: String, actual: String },
+    #[error("Truncated download: expected {expected} bytes, got {actual}")]
+    TruncatedDownload { expected: usize, actual: usize },
+    #[error("Download was cancelled")]
+    Cancelled,
+
+    // Transport
+    #[error("HTTP error {status}: {body}")]
+    Http { status: reqwest::StatusCode, body: String },
+    #[error("Network error: {0}")]
+    Network(#[source] reqwest::Error),
+    #[error("IO error: {0}")]
+    Io(#[source] std::io::Error),
+    #[error("Deserialize error: {0}")]
+    Deserialize(#[source] serde_json::Error),
+
+    // Config / format
+    #[error("Invalid product ID {0:?}")]
+    InvalidProductId(String),
+    #[error("Malformed cloud-storage path placeholder: {0:?}")]
+    MalformedRemotePath(String),
+    #[error("Unknown folder key {0:?} in remote config")]
+    UnknownFolderKey(String),
+    #[error("Invalid timestamp {0:?}")]
+    InvalidTimestamp(String),
+    #[error("Malformed save-file listing line: {0:?}")]
+    MalformedSaveLine(String),
+
+    // Internal (library bug; not expected in normal operation)
+    #[error("Internal error: {0}")]
+    Internal(String),
+}
+
+impl From<ClientError> for GogdlError {
+    fn from(e: ClientError) -> Self {
+        match e {
+            ClientError::Network(e) => GogdlError::Network(e),
+            ClientError::Io(e) => GogdlError::Io(e),
+            ClientError::Deserialize(e) => GogdlError::Deserialize(e),
+            ClientError::Http { status, body } => GogdlError::Http { status, body },
+            ClientError::TokenExpired => GogdlError::TokenExpired,
+            ClientError::NotLoggedIn => GogdlError::NotLoggedIn,
+            ClientError::HashMismatch { expected, actual } => {
+                GogdlError::HashMismatch { expected, actual }
+            }
+            ClientError::TruncatedDownload { expected, actual } => {
+                GogdlError::TruncatedDownload { expected, actual }
+            }
+            ClientError::Cancelled => GogdlError::Cancelled,
+            // game_id is unknown at this level; facade methods with access to
+            // game_id should intercept BuildNotFound before it falls through here.
+            ClientError::BuildNotFound(s) => GogdlError::BuildVersionNotFound {
+                game_id: 0,
+                version_name: s,
+            },
+            ClientError::InvalidProductId(s) => GogdlError::InvalidProductId(s),
+            ClientError::MalformedRemotePath(s) => GogdlError::MalformedRemotePath(s),
+            ClientError::UnknownFolderKey(s) => GogdlError::UnknownFolderKey(s),
+            ClientError::InvalidTimestamp(s) => GogdlError::InvalidTimestamp(s),
+            ClientError::MalformedSaveLine(s) => GogdlError::MalformedSaveLine(s),
+            ClientError::NotFound => GogdlError::Internal("no URL format in depot".into()),
+            ClientError::AsyncError(e) => GogdlError::Internal(e.to_string()),
+            ClientError::SemaphoreError(e) => GogdlError::Internal(e.to_string()),
+            ClientError::UrlParseErrr(e) => GogdlError::Internal(e.to_string()),
+            ClientError::InvalidHeader(s) => GogdlError::Internal(s),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn from_token_expired() {
+        assert!(matches!(
+            GogdlError::from(ClientError::TokenExpired),
+            GogdlError::TokenExpired
+        ));
+    }
+
+    #[test]
+    fn from_http_passes_status_and_body() {
+        let err = GogdlError::from(ClientError::Http {
+            status: StatusCode::NOT_FOUND,
+            body: "not found".into(),
+        });
+        assert!(matches!(
+            err,
+            GogdlError::Http { status, .. } if status == StatusCode::NOT_FOUND
+        ));
+    }
+
+    #[test]
+    fn from_build_not_found_uses_zero_game_id() {
+        let err = GogdlError::from(ClientError::BuildNotFound("v1.0".into()));
+        assert!(matches!(
+            err,
+            GogdlError::BuildVersionNotFound { game_id: 0, ref version_name } if version_name == "v1.0"
+        ));
+    }
+
+    #[test]
+    fn from_cancelled() {
+        assert!(matches!(
+            GogdlError::from(ClientError::Cancelled),
+            GogdlError::Cancelled
+        ));
+    }
 }
