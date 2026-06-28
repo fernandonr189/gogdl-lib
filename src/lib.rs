@@ -46,6 +46,17 @@ impl GogDl {
         }
     }
 
+    pub fn new_with_client(client: reqwest::Client, auth: Option<Auth>) -> Self {
+        let game_ids_cache = Arc::new(Mutex::new(None));
+        let game_details_cache = Arc::new(Mutex::new(HashMap::new()));
+        GogDl {
+            auth: Mutex::new(auth),
+            client,
+            game_ids_cache,
+            game_details_cache,
+        }
+    }
+
     pub fn get_login_url() -> &'static str {
         auth::LOGIN_URL
     }
@@ -548,7 +559,10 @@ pub enum GogdlError {
 
     // Transport
     #[error("HTTP error {status}: {body}")]
-    Http { status: reqwest::StatusCode, body: String },
+    Http {
+        status: reqwest::StatusCode,
+        body: String,
+    },
     #[error("Network error: {0}")]
     Network(#[source] reqwest::Error),
     #[error("IO error: {0}")]
